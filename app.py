@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
+import json
 from datetime import datetime, date
 
 # ------------- Helpers and global keys -------------
@@ -80,30 +81,123 @@ def settings_page():
 
 # ------------- Data import helpers -------------
 
+
 def parse_garmin_activities(file) -> pd.DataFrame:
     """
-    Parse Garmin activities CSV export.
+    Parse Garmin activities export (CSV or summarizedActivities.json).
 
-    Goal: normalize different Garmin export formats into:
+    Normalized output:
       date, start_time, duration_minutes, total_calories_burned, raw_type, source
-
-    It tries several common column name variants for:
-      - start time
-      - duration
-      - calories
-      - activity type
     """
 
+    name = getattr(file, "name", "").lower()
+
+    # ---------- JSON path (summarizedActivities.json) ----------
+    if name.endswith(".json"):
+        raw = json.load(file)
+
+        # raw may be a list of activities or a dict that contains a list
+        if isinstance(raw, list):
+            items = raw
+        elif isinstance(raw, dict):
+            # try a few typical keys, fall back to first list value
+            candidates = [
+                "summarizedActivitiesExport",
+                "activities",
+                "activityList",
+            ]
+            items = None
+            for key in candidates:
+                if key in raw and isinstance(raw[key], list):
+                    items = raw[key]
+                    break
+            if items is None:
+                for v in raw.values():
+                    if isinstance(v, list):
+                        items = v
+                        break
+        else:
+            items = []
+
+        if not items:
+            raise ValueError("Garmin JSON did not contain a list of activities")
+
+        df = pd.json_normalize(items)
+
+        def pick(col_candidates):
+            for c in col_candidates:
+                if c in df.columns:
+                    return c
+            return None
+
+        # start time
+        start_col = pick([
+            "startTimeLocal",
+            "startTimeGmt",
+            "startTime",
+            "beginTimestamp",
+        ])
+        if start_col is None:
+            raise ValueError(
+                f"Could not find a start time column in Garmin JSON. "
+                f"Columns: {list(df.columns)}"
+            )
+        df["start_time"] = pd.to_datetime(df[start_col], errors="coerce")
+        df["date"] = df["start_time"].dt.date
+
+        # duration in minutes
+        dur_col = pick([
+            "durationInSeconds",
+            "elapsedDuration",
+            "elapsedTimeInSeconds",
+            "duration",
+        ])
+        if dur_col is not None and pd.api.types.is_numeric_dtype(df[dur_col]):
+            df["duration_minutes"] = df[dur_col] / 60.0
+        else:
+            df["duration_minutes"] = np.nan
+
+        # calories
+        cal_col = pick([
+            "calories",
+            "activeKilocalories",
+            "totalKilocalories",
+        ])
+        df["total_calories_burned"] = df[cal_col] if cal_col else 0.0
+
+        # activity type
+        raw_type_col = None
+        for c in ["activityType.typeKey", "activityType", "sport", "activityName"]:
+            if c in df.columns:
+                raw_type_col = c
+                break
+
+        if raw_type_col:
+            df["raw_type"] = df[raw_type_col].astype(str)
+        else:
+            df["raw_type"] = "unknown"
+
+        df["source"] = "garmin"
+
+        return df[[
+            "date",
+            "start_time",
+            "duration_minutes",
+            "total_calories_burned",
+            "raw_type",
+            "source",
+        ]]
+
+    # ---------- CSV path (older or manual exports) ----------
     df = pd.read_csv(file)
 
-    # Helper to pick the first existing column from a list of candidates
     def pick(col_candidates):
         for c in col_candidates:
             if c in df.columns:
                 return c
         return None
 
-    # 1) Start time
+    # start time
     start_col = pick([
         "Start Time",
         "Start time",
@@ -115,18 +209,14 @@ def parse_garmin_activities(file) -> pd.DataFrame:
     ])
     if start_col is None:
         raise ValueError(
-            f"Could not find a start time column in Garmin file. "
-            f"Available columns: {list(df.columns)}"
+            f"Could not find a start time column in Garmin CSV. "
+            f"Columns: {list(df.columns)}"
         )
 
     df["start_time"] = pd.to_datetime(df[start_col], errors="coerce")
     df["date"] = df["start_time"].dt.date
 
-    # 2) Duration in minutes
-    # Common patterns:
-    #   - "Duration" in seconds
-    #   - "Elapsed Time" in seconds
-    #   - "Duration" as "hh:mm:ss" string
+    # duration
     duration_col = pick([
         "Duration",
         "Elapsed Time",
@@ -135,13 +225,10 @@ def parse_garmin_activities(file) -> pd.DataFrame:
         "elapsed_time",
     ])
 
-    duration_minutes = None
     if duration_col is not None:
-        # Try numeric seconds first
         if pd.api.types.is_numeric_dtype(df[duration_col]):
             duration_minutes = df[duration_col] / 60.0
         else:
-            # Try to parse "hh:mm:ss" or "mm:ss"
             def parse_duration(val):
                 if pd.isna(val):
                     return np.nan
@@ -164,7 +251,7 @@ def parse_garmin_activities(file) -> pd.DataFrame:
 
     df["duration_minutes"] = duration_minutes
 
-    # 3) Calories burned
+    # calories
     calories_col = pick([
         "Calories",
         "calories",
@@ -177,7 +264,7 @@ def parse_garmin_activities(file) -> pd.DataFrame:
     else:
         df["total_calories_burned"] = 0.0
 
-    # 4) Activity type
+    # activity type
     raw_type_col = pick([
         "Activity Type",
         "Activity type",
@@ -193,8 +280,15 @@ def parse_garmin_activities(file) -> pd.DataFrame:
 
     df["source"] = "garmin"
 
-    return df[["date", "start_time", "duration_minutes",
-               "total_calories_burned", "raw_type", "source"]]
+    return df[[
+        "date",
+        "start_time",
+        "duration_minutes",
+        "total_calories_burned",
+        "raw_type",
+        "source",
+    ]]
+
 
 
 def parse_hevy_workouts(file) -> pd.DataFrame:
@@ -391,7 +485,10 @@ def data_import_page():
 
     st.markdown("Upload your latest exports from Garmin, Hevy and MyFitnessPal.")
 
-    garmin_file = st.file_uploader("Garmin activities export (CSV)", type="csv")
+    garmin_file = st.file_uploader(
+    "Garmin activities export (CSV or summarizedActivities.json)",
+    type=["csv", "json"]
+)
     hevy_file = st.file_uploader("Hevy workouts export (CSV)", type="csv")
     mfp_file = st.file_uploader("MyFitnessPal nutrition export (CSV)", type="csv")
 
