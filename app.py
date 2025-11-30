@@ -64,7 +64,102 @@ def get_strava_secrets():
 
     return client_id, client_secret, access_token
 
+def fetch_hevy_activities_from_api(days_back: int = 30) -> pd.DataFrame:
+    """
+    Fetch workouts from the Hevy public API and normalize them into the
+    activities schema used by the app:
 
+      date, start_time, duration_minutes, total_calories_burned, raw_type, source
+
+    For now we only need workout level information here. Set level
+    analytics can be added on top later.
+    """
+    # Check secrets
+    if "hevy" not in st.secrets or "api_key" not in st.secrets["hevy"]:
+        raise RuntimeError("Hevy API key not configured in .streamlit/secrets.toml")
+
+    api_key = st.secrets["hevy"]["api_key"]
+
+    base_url = "https://api.hevyapp.com/v1/workouts"
+    headers = {
+        "accept": "application/json",
+        "api-key": api_key,
+    }
+
+    since_dt = datetime.utcnow() - timedelta(days=days_back)
+    since_iso = since_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    all_workouts = []
+    page = 1
+    page_size = 50
+
+    while True:
+        params = {
+            "page": page,
+            "pageSize": page_size,
+            "since": since_iso,
+        }
+        resp = requests.get(base_url, headers=headers, params=params, timeout=15)
+
+        if resp.status_code != 200:
+            raise RuntimeError(
+                f"Hevy API error {resp.status_code}: {resp.text[:400]}"
+            )
+
+        data = resp.json()
+        workouts = data.get("workouts", [])
+
+        if not workouts:
+            break
+
+        all_workouts.extend(workouts)
+
+        # simple stop condition: last page shorter than page_size
+        if len(workouts) < page_size:
+            break
+
+        page += 1
+
+    if not all_workouts:
+        return pd.DataFrame(
+            columns=[
+                "date",
+                "start_time",
+                "duration_minutes",
+                "total_calories_burned",
+                "raw_type",
+                "source",
+            ]
+        )
+
+    rows = []
+    for w in all_workouts:
+        # Hevy returns ISO timestamps
+        start = pd.to_datetime(w.get("start_time"), utc=True, errors="coerce")
+        end = pd.to_datetime(w.get("end_time"), utc=True, errors="coerce")
+
+        if pd.isna(start) or pd.isna(end):
+            continue
+
+        dur_min = (end - start).total_seconds() / 60.0
+
+        rows.append(
+            {
+                "date": start.date(),
+                "start_time": start,
+                "duration_minutes": dur_min,
+                "total_calories_burned": 0.0,  # we keep calories from Strava/Garmin
+                "raw_type": "strength_training",
+                "source": "hevy",
+            }
+        )
+
+    df = pd.DataFrame(rows)
+
+    # remove potential duplicates (same workout pulled twice)
+    df = df.drop_duplicates(subset=["start_time", "source"])
+
+    return df
 
 # ------------- Settings page -------------
 
@@ -390,74 +485,114 @@ def build_daily_summary(activities: pd.DataFrame,
 def data_import_page():
     st.header("Data import")
 
-    st.markdown(
-        "This MVP uses Strava API for activities and Hevy CSV for strength details. "
-        "Nutrition will later use FatSecret."
+    st.markdown("Upload exports and/or sync via APIs.")
+
+    # ---------------- Strava (already implemented) ----------------
+    st.subheader("Strava activities (API)")
+    days_strava = st.number_input(
+        "Days to sync from Strava",
+        min_value=1,
+        max_value=365,
+        value=30,
+        step=1,
+        key="days_strava_api",
     )
 
-    with st.expander("Debug Strava secrets"):
-        try:
-            sec = st.secrets["strava"]
-            st.write("Found [strava] section.")
-            st.write("Keys:", list(sec.keys()))
-        except Exception as e:
-            st.write("Could not find [strava] section.")
-            st.write(str(e))
-
-
-    # Strava sync
-    st.subheader("Strava activities (API)")
-    col1, col2 = st.columns([1, 1])
-    with col1:
-        days_back = st.number_input(
-            "Days to sync from Strava",
-            min_value=7,
-            max_value=365,
-            value=30,
-            step=1,
-        )
-    with col2:
-        st.caption(
-            "Uses the athlete activities endpoint. Make sure Strava secrets are set."
-        )
-
-    strava_df = None
+    strava_activities = pd.DataFrame()
     if st.button("Sync from Strava"):
+        from strava_api import fetch_strava_activities  # wherever you put it
+
         try:
-            strava_df = fetch_strava_activities(days_back=int(days_back))
-            st.success(f"Fetched {len(strava_df)} activities from Strava.")
-            st.dataframe(strava_df.head())
+            strava_activities = fetch_strava_activities(days_back=days_strava)
+            st.success(f"Fetched {len(strava_activities)} activities from Strava.")
+            st.dataframe(strava_activities.head())
         except Exception as e:
             st.error(f"Error fetching Strava activities: {e}")
 
-    # Hevy CSV
-    st.subheader("Hevy workouts export (CSV)")
-    hevy_file = st.file_uploader("Upload Hevy CSV", type="csv")
-    hevy_df = None
-    if hevy_file is not None:
+    st.markdown("---")
+
+    # ---------------- Hevy via API ----------------
+    st.subheader("Hevy activities (API)")
+    days_hevy = st.number_input(
+        "Days to sync from Hevy",
+        min_value=1,
+        max_value=365,
+        value=30,
+        step=1,
+        key="days_hevy_api",
+    )
+
+    hevy_activities_api = pd.DataFrame()
+    if st.button("Sync from Hevy"):
         try:
-            hevy_df = parse_hevy_workouts(hevy_file)
-            st.caption("Sample Hevy workouts (session level)")
-            st.dataframe(hevy_df.head())
+            hevy_activities_api = fetch_hevy_activities_from_api(days_back=days_hevy)
+            st.success(f"Fetched {len(hevy_activities_api)} workouts from Hevy.")
+            if not hevy_activities_api.empty:
+                st.dataframe(hevy_activities_api.head())
         except Exception as e:
-            st.error(f"Error parsing Hevy CSV: {e}")
+            st.error(f"Error fetching Hevy activities: {e}")
 
-    # Nutrition placeholder (will be FatSecret later)
-    st.subheader("Nutrition")
-    st.info("Nutrition is not wired yet. FatSecret API will be integrated later.")
-    nutrition = pd.DataFrame()
+    st.markdown("---")
 
-    if st.button("Build daily summary"):
+    # ---------------- Optional CSV uploads (Garmin + Hevy CSV) ----------------
+    st.subheader("CSV uploads (optional)")
+
+    st.markdown("Garmin activities export (CSV or summarizedActivities.json)")
+    garmin_file = st.file_uploader(
+        "Garmin activities file",
+        type=["csv", "json"],
+        key="garmin_file_uploader",
+    )
+
+    hevy_file = st.file_uploader(
+        "Hevy workouts export (CSV)",
+        type="csv",
+        key="hevy_csv_file_uploader",
+    )
+
+    mfp_file = None  # we skip MyFitnessPal for now
+
+    if st.button("Process CSV files"):
         activities_list = []
-        if strava_df is not None:
-            activities_list.append(strava_df)
-        if hevy_df is not None:
-            activities_list.append(hevy_df)
 
-        if activities_list:
-            activities = pd.concat(activities_list, ignore_index=True)
+        if garmin_file is not None:
+            garmin_df = parse_garmin_activities(garmin_file)
+            activities_list.append(garmin_df)
+
+        if hevy_file is not None:
+            hevy_df_csv = parse_hevy_workouts(hevy_file)
+            activities_list.append(hevy_df_csv)
+
+        # combine CSV-based activities
+        csv_activities = (
+            pd.concat(activities_list, ignore_index=True) if activities_list else pd.DataFrame()
+        )
+
+        if not csv_activities.empty:
+            st.success(f"Processed {len(csv_activities)} activities from CSV.")
+            st.dataframe(csv_activities.head())
+        else:
+            st.info("No CSV activities processed.")
+
+        # you can also build nutrition here later when FatSecret is wired
+
+        # merge all sources for the main app state
+        all_activities = []
+
+        if not strava_activities.empty:
+            all_activities.append(strava_activities)
+        if not hevy_activities_api.empty:
+            all_activities.append(hevy_activities_api)
+        if not csv_activities.empty:
+            all_activities.append(csv_activities)
+
+        if all_activities:
+            activities = pd.concat(all_activities, ignore_index=True)
         else:
             activities = pd.DataFrame()
+
+        # at this point nutrition is still empty
+        nutrition = pd.DataFrame()
 
         settings = st.session_state[SETTINGS_KEY]
         activities = classify_sessions(activities, settings)
@@ -466,7 +601,7 @@ def data_import_page():
         st.session_state[ACTIVITIES_KEY] = activities
         st.session_state[DAILY_SUMMARY_KEY] = daily
 
-        st.success("Data processed and stored in session.")
+        st.success("All data processed and stored in session.")
         if not activities.empty:
             st.write("Sample activities:")
             st.dataframe(activities.head())
