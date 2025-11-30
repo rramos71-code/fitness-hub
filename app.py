@@ -551,16 +551,26 @@ def data_import_page():
         type=["csv", "json"],
         key="garmin_file",
     )
-    hevy_file = st.file_uploader("Hevy workouts export (CSV)", type="csv", key="hevy_workouts_file")
-    mfp_file = st.file_uploader("MyFitnessPal nutrition export (CSV)", type="csv", key="mfp_file")
+    hevy_file = st.file_uploader(
+        "Hevy workouts export (CSV)",
+        type="csv",
+        key="hevy_workouts_file",
+    )
+    mfp_file = st.file_uploader(
+        "MyFitnessPal nutrition export (CSV)",
+        type="csv",
+        key="mfp_file",
+    )
 
     if st.button("Process files"):
         activities_list = []
 
+        # 1) Garmin activities → sessions
         if garmin_file is not None:
             garmin_df = parse_garmin_activities(garmin_file)
             activities_list.append(garmin_df)
 
+        # 2) Hevy workouts → sessions (for duration)
         if hevy_file is not None:
             hevy_sessions_df = parse_hevy_workouts(hevy_file)
             activities_list.append(hevy_sessions_df)
@@ -570,15 +580,35 @@ def data_import_page():
         else:
             activities = pd.DataFrame()
 
+        # 3) Nutrition (still from MFP CSV for now)
         nutrition = pd.DataFrame()
         if mfp_file is not None:
             nutrition = parse_mfp_nutrition(mfp_file)
 
-        # classify and build daily summary
+        # 4) Classify sessions and build base daily summary (calories + minutes)
         settings = st.session_state[SETTINGS_KEY]
         activities = classify_sessions(activities, settings)
         daily = build_daily_summary(activities, nutrition, settings)
 
+        # 5) Hevy detailed sets → daily strength metrics, merge by date
+        if hevy_file is not None:
+            hevy_raw_df = pd.read_csv(hevy_file)
+            daily_strength = aggregate_hevy_daily(hevy_raw_df)
+
+            # store separately as well if needed later
+            st.session_state["daily_strength"] = daily_strength
+
+            if not daily.empty:
+                # make sure date types match
+                daily["date"] = pd.to_datetime(daily["date"]).dt.date
+                daily_strength["date"] = pd.to_datetime(daily_strength["date"]).dt.date
+
+                daily = daily.merge(daily_strength, on="date", how="left")
+            else:
+                # if no activities/nutrition but we do have strength data
+                daily = daily_strength.copy()
+
+        # 6) Save to session and show samples
         st.session_state[ACTIVITIES_KEY] = activities
         st.session_state[DAILY_SUMMARY_KEY] = daily
 
@@ -587,7 +617,7 @@ def data_import_page():
             st.write("Sample activities:")
             st.dataframe(activities.head())
         if not daily.empty:
-            st.write("Sample daily summary:")
+            st.write("Sample daily summary (with strength columns if Hevy provided):")
             st.dataframe(daily.head())
 
     st.info("Below is a separate Hevy section for detailed sets and volume (MVP for the strength advisor).")
