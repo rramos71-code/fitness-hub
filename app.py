@@ -70,9 +70,6 @@ def fetch_hevy_activities_from_api(days_back: int = 30) -> pd.DataFrame:
     activities schema used by the app:
 
       date, start_time, duration_minutes, total_calories_burned, raw_type, source
-
-    For now we only need workout level information here. Set level
-    analytics can be added on top later.
     """
     # Check secrets
     if "hevy" not in st.secrets or "api_key" not in st.secrets["hevy"]:
@@ -91,7 +88,7 @@ def fetch_hevy_activities_from_api(days_back: int = 30) -> pd.DataFrame:
 
     all_workouts = []
     page = 1
-    page_size = 50
+    page_size = 10  # Hevy API restriction
 
     while True:
         params = {
@@ -107,6 +104,8 @@ def fetch_hevy_activities_from_api(days_back: int = 30) -> pd.DataFrame:
             )
 
         data = resp.json()
+
+        # Hevy returns workouts under "workouts"
         workouts = data.get("workouts", [])
 
         if not workouts:
@@ -114,7 +113,7 @@ def fetch_hevy_activities_from_api(days_back: int = 30) -> pd.DataFrame:
 
         all_workouts.extend(workouts)
 
-        # simple stop condition: last page shorter than page_size
+        # stop if we got fewer than page_size, so we are at the last page
         if len(workouts) < page_size:
             break
 
@@ -134,7 +133,7 @@ def fetch_hevy_activities_from_api(days_back: int = 30) -> pd.DataFrame:
 
     rows = []
     for w in all_workouts:
-        # Hevy returns ISO timestamps
+        # adjust keys if Hevy uses different field names
         start = pd.to_datetime(w.get("start_time"), utc=True, errors="coerce")
         end = pd.to_datetime(w.get("end_time"), utc=True, errors="coerce")
 
@@ -148,17 +147,14 @@ def fetch_hevy_activities_from_api(days_back: int = 30) -> pd.DataFrame:
                 "date": start.date(),
                 "start_time": start,
                 "duration_minutes": dur_min,
-                "total_calories_burned": 0.0,  # we keep calories from Strava/Garmin
+                "total_calories_burned": 0.0,
                 "raw_type": "strength_training",
                 "source": "hevy",
             }
         )
 
     df = pd.DataFrame(rows)
-
-    # remove potential duplicates (same workout pulled twice)
     df = df.drop_duplicates(subset=["start_time", "source"])
-
     return df
 
 # ------------- Settings page -------------
