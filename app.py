@@ -30,6 +30,41 @@ def init_session_state():
     if DAILY_SUMMARY_KEY not in st.session_state:
         st.session_state[DAILY_SUMMARY_KEY] = pd.DataFrame()
 
+def get_strava_secrets():
+    """
+    Read Strava secrets from st.secrets.
+
+    Expected structure in .streamlit/secrets.toml:
+
+      [strava]
+      client_id = "187872"
+      client_secret = "..."
+      access_token = "..."
+    """
+    try:
+        section = st.secrets["strava"]
+    except Exception:
+        raise ValueError(
+            f"Strava block [strava] not found in secrets. "
+            f"Available sections: {list(st.secrets.keys())}"
+        )
+
+    required = ["client_id", "client_secret", "access_token"]
+    missing = [k for k in required if k not in section]
+
+    if missing:
+        raise ValueError(
+            f"Strava secrets missing keys: {missing}. "
+            f"Present keys: {list(section.keys())}"
+        )
+
+    client_id = str(section["client_id"])
+    client_secret = section["client_secret"]
+    access_token = section["access_token"]
+
+    return client_id, client_secret, access_token
+
+
 
 # ------------- Settings page -------------
 
@@ -359,6 +394,16 @@ def data_import_page():
         "This MVP uses Strava API for activities and Hevy CSV for strength details. "
         "Nutrition will later use FatSecret."
     )
+
+    with st.expander("Debug Strava secrets"):
+        try:
+            sec = st.secrets["strava"]
+            st.write("Found [strava] section.")
+            st.write("Keys:", list(sec.keys()))
+        except Exception as e:
+            st.write("Could not find [strava] section.")
+            st.write(str(e))
+
 
     # Strava sync
     st.subheader("Strava activities (API)")
