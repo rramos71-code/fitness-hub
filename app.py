@@ -157,6 +157,35 @@ def fetch_hevy_activities_from_api(days_back: int = 30) -> pd.DataFrame:
     df = df.drop_duplicates(subset=["start_time", "source"])
     return df
 
+def merge_activities_into_session(new_acts: pd.DataFrame):
+    """Merge newly fetched activities into the main activities + daily summary."""
+    if new_acts is None or new_acts.empty:
+        return
+
+    # classify sessions using existing rules
+    settings = st.session_state[SETTINGS_KEY]
+    new_acts = classify_sessions(new_acts, settings)
+
+    # existing activities in session
+    existing = st.session_state.get(ACTIVITIES_KEY, pd.DataFrame())
+    if existing is None or existing.empty:
+        combined = new_acts.copy()
+    else:
+        combined = pd.concat([existing, new_acts], ignore_index=True)
+
+        # de-duplicate on basic identity keys
+        combined = combined.drop_duplicates(
+            subset=["date", "start_time", "raw_type", "source"],
+            keep="last",
+        )
+
+    # rebuild daily summary (no nutrition yet, so pass empty df for now)
+    daily = build_daily_summary(combined, pd.DataFrame(), settings)
+
+    st.session_state[ACTIVITIES_KEY] = combined
+    st.session_state[DAILY_SUMMARY_KEY] = daily
+
+
 # ------------- Settings page -------------
 
 def settings_page():
