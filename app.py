@@ -540,11 +540,11 @@ def data_import_page():
         key="garmin_file_uploader",
     )
 
-    hevy_file = st.file_uploader(
-        "Hevy workouts export (CSV)",
-        type="csv",
-        key="hevy_csv_file_uploader",
-    )
+#    hevy_file = st.file_uploader(
+#        "Hevy workouts export (CSV)",
+#        type="csv",
+#        key="hevy_csv_file_uploader",
+#    )
 
     mfp_file = None  # we skip MyFitnessPal for now
 
@@ -555,9 +555,9 @@ def data_import_page():
             garmin_df = parse_garmin_activities(garmin_file)
             activities_list.append(garmin_df)
 
-        if hevy_file is not None:
-            hevy_df_csv = parse_hevy_workouts(hevy_file)
-            activities_list.append(hevy_df_csv)
+#        if hevy_file is not None:
+#            hevy_df_csv = parse_hevy_workouts(hevy_file)
+#            activities_list.append(hevy_df_csv)
 
         # combine CSV-based activities
         csv_activities = (
@@ -714,6 +714,57 @@ def dashboard_page():
               - days with data: {int(last['sessions'])}
             """
         )
+
+
+
+# ------------- Hevy API page -------------
+
+def hevy_api_page():
+    st.header("Hevy activities (API)")
+
+    days_back = st.number_input(
+        "Days to sync from Hevy",
+        min_value=1,
+        max_value=90,
+        value=30,
+        step=1,
+    )
+
+    if st.button("Sync from Hevy"):
+        try:
+            # 1) Pull from Hevy API
+            hevy_df = fetch_hevy_activities_from_api(days_back)
+
+            # 2) Classify sessions (gym / functional / etc.)
+            settings = st.session_state[SETTINGS_KEY]
+            hevy_df = classify_sessions(hevy_df, settings)
+
+            # 3) Merge with any existing activities (e.g. Strava or imports)
+            current = st.session_state.get(ACTIVITIES_KEY, pd.DataFrame())
+            if current is not None and not current.empty:
+                all_activities = pd.concat([current, hevy_df], ignore_index=True)
+                # avoid duplicates if you sync multiple times
+                all_activities = all_activities.drop_duplicates(
+                    subset=["start_time", "source"]
+                )
+            else:
+                all_activities = hevy_df
+
+            st.session_state[ACTIVITIES_KEY] = all_activities
+
+            # 4) Rebuild daily summary (nutrition empty for now, FatSecret later)
+            nutrition = pd.DataFrame()
+            daily = build_daily_summary(all_activities, nutrition, settings)
+            st.session_state[DAILY_SUMMARY_KEY] = daily
+
+            # 5) Show feedback
+            st.success(f"Fetched {len(hevy_df)} workouts from Hevy.")
+            st.caption("Latest Hevy workouts (normalized)")
+            st.dataframe(hevy_df.head())
+
+        except Exception as e:
+            st.error(f"Error fetching Hevy activities: {e}")
+            st.exception(e)
 
 
 # ------------- Future API info page -------------
