@@ -92,61 +92,88 @@ def parse_garmin_activities(file) -> pd.DataFrame:
 
     name = getattr(file, "name", "").lower()
 
-    # ---------- JSON path (summarizedActivities.json) ----------
+    # ---------- Helper for picking columns ----------
+    def pick(df, candidates):
+        cols = [c for c in candidates if c in df.columns]
+        if cols:
+            return cols[0]
+        # fuzzy: search by substring
+        lower_map = {c.lower(): c for c in df.columns}
+        for cand in candidates:
+            cand_low = cand.lower()
+            for col_low, col_orig in lower_map.items():
+                if cand_low in col_low:
+                    return col_orig
+        return None
+
+    # ---------- Helper to find a list of activity dicts in arbitrary JSON ----------
+    def find_activity_list(obj, depth=0, max_depth=5):
+        if depth > max_depth:
+            return None
+        if isinstance(obj, list) and obj and isinstance(obj[0], dict):
+            # heuristics: does first element look like an activity?
+            keys = set(k.lower() for k in obj[0].keys())
+            hints = {"starttimelocal", "starttimegmt", "durationinseconds", "activitytype", "calories"}
+            if keys & hints:
+                return obj
+        if isinstance(obj, dict):
+            for v in obj.values():
+                found = find_activity_list(v, depth + 1, max_depth)
+                if found is not None:
+                    return found
+        if isinstance(obj, list):
+            for v in obj:
+                found = find_activity_list(v, depth + 1, max_depth)
+                if found is not None:
+                    return found
+        return None
+
+    # ---------- JSON path ----------
     if name.endswith(".json"):
         raw = json.load(file)
 
-        # raw may be a list of activities or a dict that contains a list
+        items = None
         if isinstance(raw, list):
-            items = raw
+            items = find_activity_list(raw) or raw
         elif isinstance(raw, dict):
-            # try a few typical keys, fall back to first list value
-            candidates = [
-                "summarizedActivitiesExport",
-                "activities",
-                "activityList",
-            ]
-            items = None
-            for key in candidates:
-                if key in raw and isinstance(raw[key], list):
-                    items = raw[key]
-                    break
-            if items is None:
-                for v in raw.values():
-                    if isinstance(v, list):
-                        items = v
-                        break
-        else:
-            items = []
+            items = find_activity_list(raw)
 
         if not items:
-            raise ValueError("Garmin JSON did not contain a list of activities")
+            # graceful fallback: empty dataframe
+            return pd.DataFrame(
+                columns=[
+                    "date",
+                    "start_time",
+                    "duration_minutes",
+                    "total_calories_burned",
+                    "raw_type",
+                    "source",
+                ]
+            )
 
         df = pd.json_normalize(items)
 
-        def pick(col_candidates):
-            for c in col_candidates:
-                if c in df.columns:
-                    return c
-            return None
-
         # start time
-        start_col = pick([
+        start_col = pick(df, [
             "startTimeLocal",
             "startTimeGmt",
             "startTime",
             "beginTimestamp",
         ])
-        if start_col is None:
-            raise ValueError(
-                f"Could not find a start time column in Garmin JSON. "
-                f"Columns: {list(df.columns)}"
-            )
-        df["start_time"] = pd.to_datetime(df[start_col], errors="coerce")
+        if start_col is not None:
+            df["start_time"] = pd.to_datetime(df[start_col], errors="coerce")
+        else:
+            # try any column that contains "start" and "time"
+            candidates = [c for c in df.columns if "start" in c.lower() and "time" in c.lower()]
+            if candidates:
+                col = candidates[0]
+                df["start_time"] = pd.to_datetime(df[col], errors="coerce")
+            else:
+                df["start_time"] = pd.NaT
         df["date"] = df["start_time"].dt.date
 
         # duration in minutes
-        dur_col = pick([
+        dur_col = pick(df, [
             "durationInSeconds",
             "elapsedDuration",
             "elapsedTimeInSeconds",
@@ -158,20 +185,24 @@ def parse_garmin_activities(file) -> pd.DataFrame:
             df["duration_minutes"] = np.nan
 
         # calories
-        cal_col = pick([
+        cal_col = pick(df, [
             "calories",
             "activeKilocalories",
             "totalKilocalories",
         ])
-        df["total_calories_burned"] = df[cal_col] if cal_col else 0.0
+        if cal_col is not None:
+            df["total_calories_burned"] = df[cal_col]
+        else:
+            df["total_calories_burned"] = 0.0
 
         # activity type
-        raw_type_col = None
-        for c in ["activityType.typeKey", "activityType", "sport", "activityName"]:
-            if c in df.columns:
-                raw_type_col = c
-                break
-
+        raw_type_col = pick(df, [
+            "activityType.typeKey",
+            "activityType",
+            "sport",
+            "activityName",
+            "activityTypeId",
+        ])
         if raw_type_col:
             df["raw_type"] = df[raw_type_col].astype(str)
         else:
@@ -188,17 +219,11 @@ def parse_garmin_activities(file) -> pd.DataFrame:
             "source",
         ]]
 
-    # ---------- CSV path (older or manual exports) ----------
+    # ---------- CSV path (kept as before, but without hard errors) ----------
     df = pd.read_csv(file)
 
-    def pick(col_candidates):
-        for c in col_candidates:
-            if c in df.columns:
-                return c
-        return None
-
     # start time
-    start_col = pick([
+    start_col = pick(df, [
         "Start Time",
         "Start time",
         "Start",
@@ -207,17 +232,14 @@ def parse_garmin_activities(file) -> pd.DataFrame:
         "startTime",
         "start_time",
     ])
-    if start_col is None:
-        raise ValueError(
-            f"Could not find a start time column in Garmin CSV. "
-            f"Columns: {list(df.columns)}"
-        )
-
-    df["start_time"] = pd.to_datetime(df[start_col], errors="coerce")
+    if start_col is not None:
+        df["start_time"] = pd.to_datetime(df[start_col], errors="coerce")
+    else:
+        df["start_time"] = pd.NaT
     df["date"] = df["start_time"].dt.date
 
     # duration
-    duration_col = pick([
+    duration_col = pick(df, [
         "Duration",
         "Elapsed Time",
         "ElapsedTime",
@@ -252,7 +274,7 @@ def parse_garmin_activities(file) -> pd.DataFrame:
     df["duration_minutes"] = duration_minutes
 
     # calories
-    calories_col = pick([
+    calories_col = pick(df, [
         "Calories",
         "calories",
         "Calories Burned",
@@ -265,7 +287,7 @@ def parse_garmin_activities(file) -> pd.DataFrame:
         df["total_calories_burned"] = 0.0
 
     # activity type
-    raw_type_col = pick([
+    raw_type_col = pick(df, [
         "Activity Type",
         "Activity type",
         "Type",
