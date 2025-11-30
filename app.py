@@ -124,33 +124,48 @@ def parse_garmin_activities(file) -> pd.DataFrame:
 
 def parse_hevy_workouts(file) -> pd.DataFrame:
     """
-    MVP: parse Hevy CSV export.
+    Parse Hevy CSV export.
 
-    Required normalized columns:
+    Input format (per set):
+      title, start_time, end_time, description, exercise_title,
+      superset_id, exercise_notes, set_index, set_type,
+      weight_kg, reps, distance_km, duration_seconds, rpe
+
+    We convert this into one row per workout session with:
       date, start_time, duration_minutes, total_calories_burned, raw_type, source
     """
+
     df = pd.read_csv(file)
 
-    # You will need to adjust based on Hevy export format
-    if "Date" in df.columns:
-        df["date"] = pd.to_datetime(df["Date"]).dt.date
-    else:
-        df["date"] = pd.to_datetime(df["date"]).dt.date
+    # Parse start and end datetime
+    # Example: "28 Nov 2025, 07:05"
+    df["start_dt"] = pd.to_datetime(df["start_time"], format="%d %b %Y, %H:%M")
+    df["end_dt"] = pd.to_datetime(df["end_time"], format="%d %b %Y, %H:%M")
 
-    if "Start Time" in df.columns:
-        df["start_time"] = pd.to_datetime(df["Start Time"])
-    else:
-        df["start_time"] = pd.to_datetime(df["date"])
+    # Workout date from start time
+    df["date"] = df["start_dt"].dt.date
 
-    # duration is often not in Hevy export, so we approximate or set null
-    df["duration_minutes"] = df.get("Duration (minutes)", np.nan)
+    # Duration of the whole workout in minutes
+    # Same start/end for all sets in a workout, so we can compute once per row and then aggregate
+    df["duration_minutes"] = (df["end_dt"] - df["start_dt"]).dt.total_seconds() / 60.0
 
-    df["total_calories_burned"] = 0.0  # Garmin gives better calories
-    df["raw_type"] = "strength"
-    df["source"] = "hevy"
+    # Group by workout, not by set
+    grouped = (
+        df.groupby(["title", "start_dt", "end_dt"], as_index=False)
+        .agg(
+            date=("date", "first"),
+            duration_minutes=("duration_minutes", "max"),
+        )
+    )
 
-    return df[["date", "start_time", "duration_minutes",
-               "total_calories_burned", "raw_type", "source"]]
+    # Normalized columns expected by the app
+    grouped = grouped.rename(columns={"start_dt": "start_time"})
+    grouped["total_calories_burned"] = 0.0  # We will use Garmin for calories
+    grouped["raw_type"] = "strength"
+    grouped["source"] = "hevy"
+
+    return grouped[["date", "start_time", "duration_minutes",
+                    "total_calories_burned", "raw_type", "source"]]
 
 
 def parse_mfp_nutrition(file) -> pd.DataFrame:
