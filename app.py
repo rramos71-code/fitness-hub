@@ -82,40 +82,115 @@ def settings_page():
 
 def parse_garmin_activities(file) -> pd.DataFrame:
     """
-    MVP: assume CSV from Garmin or Garmin Connect export.
-    You will need to map your actual column names.
+    Parse Garmin activities CSV export.
 
-    Required normalized columns for this app:
+    Goal: normalize different Garmin export formats into:
       date, start_time, duration_minutes, total_calories_burned, raw_type, source
+
+    It tries several common column name variants for:
+      - start time
+      - duration
+      - calories
+      - activity type
     """
+
     df = pd.read_csv(file)
 
-    # These are guesses. Adjust once you see your real export structure.
-    # Example Garmin columns: "Start Time", "Duration", "Calories"
-    if "Start Time" in df.columns:
-        df["date"] = pd.to_datetime(df["Start Time"]).dt.date
-        df["start_time"] = pd.to_datetime(df["Start Time"])
-    else:
-        # fallback, try a generic "date" column
-        df["date"] = pd.to_datetime(df["date"]).dt.date
-        df["start_time"] = pd.to_datetime(df["start_time"])
+    # Helper to pick the first existing column from a list of candidates
+    def pick(col_candidates):
+        for c in col_candidates:
+            if c in df.columns:
+                return c
+        return None
 
-    if "Duration" in df.columns:
-        # assuming seconds
-        df["duration_minutes"] = df["Duration"] / 60.0
-    elif "duration" in df.columns:
-        df["duration_minutes"] = df["duration"] / 60.0
-    else:
-        df["duration_minutes"] = np.nan
+    # 1) Start time
+    start_col = pick([
+        "Start Time",
+        "Start time",
+        "Start",
+        "Activity Start Date",
+        "StartTime",
+        "startTime",
+        "start_time",
+    ])
+    if start_col is None:
+        raise ValueError(
+            f"Could not find a start time column in Garmin file. "
+            f"Available columns: {list(df.columns)}"
+        )
 
-    if "Calories" in df.columns:
-        df["total_calories_burned"] = df["Calories"]
-    elif "calories" in df.columns:
-        df["total_calories_burned"] = df["calories"]
+    df["start_time"] = pd.to_datetime(df[start_col], errors="coerce")
+    df["date"] = df["start_time"].dt.date
+
+    # 2) Duration in minutes
+    # Common patterns:
+    #   - "Duration" in seconds
+    #   - "Elapsed Time" in seconds
+    #   - "Duration" as "hh:mm:ss" string
+    duration_col = pick([
+        "Duration",
+        "Elapsed Time",
+        "ElapsedTime",
+        "duration",
+        "elapsed_time",
+    ])
+
+    duration_minutes = None
+    if duration_col is not None:
+        # Try numeric seconds first
+        if pd.api.types.is_numeric_dtype(df[duration_col]):
+            duration_minutes = df[duration_col] / 60.0
+        else:
+            # Try to parse "hh:mm:ss" or "mm:ss"
+            def parse_duration(val):
+                if pd.isna(val):
+                    return np.nan
+                s = str(val)
+                parts = s.split(":")
+                try:
+                    if len(parts) == 3:
+                        h, m, sec = map(float, parts)
+                        return (h * 3600 + m * 60 + sec) / 60.0
+                    if len(parts) == 2:
+                        m, sec = map(float, parts)
+                        return (m * 60 + sec) / 60.0
+                except Exception:
+                    return np.nan
+                return np.nan
+
+            duration_minutes = df[duration_col].apply(parse_duration)
+    else:
+        duration_minutes = np.nan
+
+    df["duration_minutes"] = duration_minutes
+
+    # 3) Calories burned
+    calories_col = pick([
+        "Calories",
+        "calories",
+        "Calories Burned",
+        "Energy Expenditure",
+        "Total Calories",
+    ])
+    if calories_col is not None:
+        df["total_calories_burned"] = df[calories_col]
     else:
         df["total_calories_burned"] = 0.0
 
-    df["raw_type"] = df.get("Activity Type", df.get("type", "unknown"))
+    # 4) Activity type
+    raw_type_col = pick([
+        "Activity Type",
+        "Activity type",
+        "Type",
+        "Sport",
+        "Activity",
+        "activity_type",
+    ])
+    if raw_type_col is not None:
+        df["raw_type"] = df[raw_type_col]
+    else:
+        df["raw_type"] = "unknown"
+
     df["source"] = "garmin"
 
     return df[["date", "start_time", "duration_minutes",
