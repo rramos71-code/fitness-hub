@@ -3,6 +3,8 @@ import pandas as pd
 import numpy as np
 import json
 from datetime import datetime, date
+from data_model import aggregate_hevy_daily
+
 
 # ------------- Helpers and global keys -------------
 
@@ -80,7 +82,6 @@ def settings_page():
 
 
 # ------------- Data import helpers -------------
-
 
 def parse_garmin_activities(file) -> pd.DataFrame:
     """
@@ -219,7 +220,7 @@ def parse_garmin_activities(file) -> pd.DataFrame:
             "source",
         ]]
 
-    # ---------- CSV path (kept as before, but without hard errors) ----------
+    # ---------- CSV path ----------
     df = pd.read_csv(file)
 
     # start time
@@ -312,17 +313,16 @@ def parse_garmin_activities(file) -> pd.DataFrame:
     ]]
 
 
-
 def parse_hevy_workouts(file) -> pd.DataFrame:
     """
-    Parse Hevy CSV export.
+    Parse Hevy CSV export as sessions (for activity minutes).
 
     Input format (per set):
       title, start_time, end_time, description, exercise_title,
       superset_id, exercise_notes, set_index, set_type,
       weight_kg, reps, distance_km, duration_seconds, rpe
 
-    We convert this into one row per workout session with:
+    Output (per workout session):
       date, start_time, duration_minutes, total_calories_burned, raw_type, source
     """
 
@@ -337,7 +337,6 @@ def parse_hevy_workouts(file) -> pd.DataFrame:
     df["date"] = df["start_dt"].dt.date
 
     # Duration of the whole workout in minutes
-    # Same start/end for all sets in a workout, so we can compute once per row and then aggregate
     df["duration_minutes"] = (df["end_dt"] - df["start_dt"]).dt.total_seconds() / 60.0
 
     # Group by workout, not by set
@@ -351,12 +350,18 @@ def parse_hevy_workouts(file) -> pd.DataFrame:
 
     # Normalized columns expected by the app
     grouped = grouped.rename(columns={"start_dt": "start_time"})
-    grouped["total_calories_burned"] = 0.0  # We will use Garmin for calories
+    grouped["total_calories_burned"] = 0.0  # Garmin will handle calories
     grouped["raw_type"] = "strength"
     grouped["source"] = "hevy"
 
-    return grouped[["date", "start_time", "duration_minutes",
-                    "total_calories_burned", "raw_type", "source"]]
+    return grouped[[
+        "date",
+        "start_time",
+        "duration_minutes",
+        "total_calories_burned",
+        "raw_type",
+        "source",
+    ]]
 
 
 def parse_mfp_nutrition(file) -> pd.DataFrame:
@@ -364,7 +369,7 @@ def parse_mfp_nutrition(file) -> pd.DataFrame:
     MVP: parse MyFitnessPal CSV export.
 
     Output columns:
-      date, calories_in, protein_g, carbs_g, fats_g
+      date, calories_in, protein_g, carbs_g, fat_g
     """
     df = pd.read_csv(file)
 
@@ -493,11 +498,45 @@ def build_daily_summary(activities: pd.DataFrame,
     daily["location_mode"] = daily["date"].apply(location_mode)
 
     # placeholder sleep and readiness
-    # later, add sleep and HRV once Garmin wellness exports are parsed
     daily["sleep_hours"] = np.nan
     daily["readiness_flag"] = "unknown"
 
     return daily
+
+
+# ------------- HEVY Import section (daily strength) -------------
+
+def hevy_import_section():
+    st.subheader("Hevy strength data (daily sets and volume)")
+
+    hevy_file = st.file_uploader(
+        "Upload Hevy export (CSV) for detailed sets",
+        type="csv",
+        key="hevy_csv_uploader",
+    )
+
+    if hevy_file is None:
+        st.info("Upload a Hevy CSV file to see daily strength metrics.")
+        return
+
+    # Read CSV
+    hevy_df = pd.read_csv(hevy_file)
+
+    # Store raw data in session state for reuse
+    st.session_state["hevy_df"] = hevy_df
+
+    # Show a quick preview of the raw data
+    st.caption("Raw Hevy data (first 10 rows)")
+    st.dataframe(hevy_df.head(10))
+
+    # Aggregate with aggregate_hevy_daily
+    daily_strength = aggregate_hevy_daily(hevy_df)
+
+    st.caption("Daily strength metrics from Hevy (working sets only for volume)")
+    st.dataframe(daily_strength)
+
+    # Optional: store daily metrics too
+    st.session_state["daily_strength"] = daily_strength
 
 
 # ------------- Data import page -------------
@@ -508,11 +547,12 @@ def data_import_page():
     st.markdown("Upload your latest exports from Garmin, Hevy and MyFitnessPal.")
 
     garmin_file = st.file_uploader(
-    "Garmin activities export (CSV or summarizedActivities.json)",
-    type=["csv", "json"]
-)
-    hevy_file = st.file_uploader("Hevy workouts export (CSV)", type="csv")
-    mfp_file = st.file_uploader("MyFitnessPal nutrition export (CSV)", type="csv")
+        "Garmin activities export (CSV or summarizedActivities.json)",
+        type=["csv", "json"],
+        key="garmin_file",
+    )
+    hevy_file = st.file_uploader("Hevy workouts export (CSV)", type="csv", key="hevy_workouts_file")
+    mfp_file = st.file_uploader("MyFitnessPal nutrition export (CSV)", type="csv", key="mfp_file")
 
     if st.button("Process files"):
         activities_list = []
@@ -522,8 +562,8 @@ def data_import_page():
             activities_list.append(garmin_df)
 
         if hevy_file is not None:
-            hevy_df = parse_hevy_workouts(hevy_file)
-            activities_list.append(hevy_df)
+            hevy_sessions_df = parse_hevy_workouts(hevy_file)
+            activities_list.append(hevy_sessions_df)
 
         if activities_list:
             activities = pd.concat(activities_list, ignore_index=True)
@@ -550,7 +590,10 @@ def data_import_page():
             st.write("Sample daily summary:")
             st.dataframe(daily.head())
 
-    st.info("Later we can replace file uploads with API based connectors for Garmin and Hevy.")
+    st.info("Below is a separate Hevy section for detailed sets and volume (MVP for the strength advisor).")
+
+    st.markdown("---")
+    hevy_import_section()
 
 
 # ------------- Daily hub page -------------
@@ -664,8 +707,8 @@ def future_api_connectors_info():
 
     Later we can add:
     - A Hevy connector that uses the official Hevy public API with a token stored in `st.secrets`.
-    - A Garmin connector using `python-garminconnect` or a Strava based bridge.
-    - An optional MyFitnessPal connector using a community library if you are comfortable with that.
+    - A Garmin connector using a Strava based bridge.
+    - A FatSecret based nutrition connector instead of MyFitnessPal CSV.
 
     The rest of the app logic will remain the same because data ingestion is separated from analysis.
     """)
