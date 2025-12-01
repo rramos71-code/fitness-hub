@@ -77,7 +77,7 @@ def fetch_hevy_activities_from_api(days_back: int = 30) -> pd.DataFrame:
 
     api_key = st.secrets["hevy"]["api_key"]
 
-    base_url = "https://api.hevyapp.com/v1/workouts"
+    base_url = "https://api.hevyapp.com/v1/workouts/"
     headers = {
         "accept": "application/json",
         "api-key": api_key,
