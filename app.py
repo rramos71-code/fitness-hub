@@ -3,13 +3,27 @@ import streamlit as st
 from hevy_api.client import HevyClient
 
 
-def get_hevy_client(api_key: str) -> HevyClient:
+def get_hevy_client() -> HevyClient:
     """
-    Create a HevyClient using the given API key.
+    Create a HevyClient using the HEVY_API_KEY from
+    Streamlit secrets or environment variables.
+    """
+    api_key = None
 
-    The hevy_api library reads the key from HEVY_API_KEY,
-    so we set that environment variable just for this process.
-    """
+    # 1. Streamlit secrets (Cloud and local secrets.toml)
+    if "HEVY_API_KEY" in st.secrets:
+        api_key = st.secrets["HEVY_API_KEY"]
+
+    # 2. Fallback to environment variable if needed
+    if not api_key:
+        api_key = os.getenv("HEVY_API_KEY")
+
+    if not api_key:
+        raise RuntimeError(
+            "Hevy API key not found. Set HEVY_API_KEY in Streamlit secrets "
+            "or as an environment variable."
+        )
+
     os.environ["HEVY_API_KEY"] = api_key
     return HevyClient()
 
@@ -24,21 +38,14 @@ def main():
     st.title("Fitness Hub - Hevy API connection")
 
     st.write(
-        "Paste your Hevy API key and press Test connection. "
-        "If it works, we will fetch your workouts and show a small preview."
+        "This app reads the Hevy API key from Streamlit secrets and tests the connection "
+        "automatically."
     )
 
-    api_key = st.text_input(
-        "Hevy API key",
-        type="password",
-        help="For Hevy Pro users. You get it in Hevy settings, under Developer.",
-    )
-
-    if api_key and st.button("Test connection"):
+    if st.button("Sync workouts"):
         with st.spinner("Contacting Hevy API"):
             try:
-                client = get_hevy_client(api_key)
-
+                client = get_hevy_client()
                 response = client.get_workouts()
                 workouts = response.workouts or []
 
@@ -48,7 +55,6 @@ def main():
                     last = workouts[-1]
                     st.subheader("Most recent workout")
 
-                    # Try to convert model to JSON if possible
                     if hasattr(last, "model_dump"):
                         st.json(last.model_dump())
                     elif hasattr(last, "dict"):
@@ -59,7 +65,7 @@ def main():
             except Exception as e:
                 st.error(f"Error communicating with Hevy API: {e}")
     else:
-        st.info("Enter your API key above to test the connection.")
+        st.info("Press Sync workouts to test the connection using the stored API key.")
 
 
 if __name__ == "__main__":
