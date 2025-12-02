@@ -1,53 +1,65 @@
+import os
 import streamlit as st
-import pandas as pd
-
-ACTIVITIES_KEY = "activities"
+from hevy_api.client import HevyClient
 
 
-def init_session_state():
-    if ACTIVITIES_KEY not in st.session_state:
-        st.session_state[ACTIVITIES_KEY] = pd.DataFrame()
-
-
-def load_hevy_csv(uploaded_file: "UploadedFile") -> pd.DataFrame:
+def get_hevy_client(api_key: str) -> HevyClient:
     """
-    Minimal loader for a Hevy CSV export.
-    No aggregation or transformation yet.
+    Create a HevyClient using the given API key.
+
+    The hevy_api library reads the key from HEVY_API_KEY,
+    so we set that environment variable just for this process.
     """
-    df = pd.read_csv(uploaded_file)
-    df = df.copy()
-    df.columns = [c.strip() for c in df.columns]
-    return df
+    os.environ["HEVY_API_KEY"] = api_key
+    return HevyClient()
 
 
 def main():
     st.set_page_config(
-        page_title="Fitness Hub - Hevy sync",
+        page_title="Fitness Hub - Hevy API",
         page_icon="💪",
-        layout="wide",
+        layout="centered",
     )
 
-    init_session_state()
-
-    st.title("Fitness Hub - Hevy sync")
+    st.title("Fitness Hub - Hevy API connection")
 
     st.write(
-        "Upload a Hevy CSV export. The file will be parsed and stored in session state. "
-        "No aggregation or dashboard yet, this is only to validate the connection."
+        "Paste your Hevy API key and press Test connection. "
+        "If it works, we will fetch your workouts and show a small preview."
     )
 
-    uploaded_file = st.file_uploader("Upload Hevy CSV export", type=["csv"])
+    api_key = st.text_input(
+        "Hevy API key",
+        type="password",
+        help="For Hevy Pro users. You get it in Hevy settings, under Developer.",
+    )
 
-    if uploaded_file is not None:
-        df = load_hevy_csv(uploaded_file)
-        st.session_state[ACTIVITIES_KEY] = df
-        st.success(f"Loaded {len(df)} rows from Hevy and stored them in session state.")
+    if api_key and st.button("Test connection"):
+        with st.spinner("Contacting Hevy API"):
+            try:
+                client = get_hevy_client(api_key)
 
-    # Simple visual check that data is actually stored
-    if not st.session_state[ACTIVITIES_KEY].empty:
-        st.subheader("Current synced Hevy data (preview)")
-        st.dataframe(st.session_state[ACTIVITIES_KEY].head())
-        st.caption(f"Total rows stored: {len(st.session_state[ACTIVITIES_KEY])}")
+                response = client.get_workouts()
+                workouts = response.workouts or []
+
+                st.success(f"Connection successful. Retrieved {len(workouts)} workouts.")
+
+                if workouts:
+                    last = workouts[-1]
+                    st.subheader("Most recent workout")
+
+                    # Try to convert model to JSON if possible
+                    if hasattr(last, "model_dump"):
+                        st.json(last.model_dump())
+                    elif hasattr(last, "dict"):
+                        st.json(last.dict())
+                    else:
+                        st.write(last)
+
+            except Exception as e:
+                st.error(f"Error communicating with Hevy API: {e}")
+    else:
+        st.info("Enter your API key above to test the connection.")
 
 
 if __name__ == "__main__":
