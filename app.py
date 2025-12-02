@@ -77,8 +77,8 @@ def fetch_hevy_activities_from_api(days_back: int = 30) -> pd.DataFrame:
 
     api_key = st.secrets["hevy"]["api_key"]
 
-    # Correct endpoint according to Hevy public API docs
-    base_url = "https://api.hevyapp.com/v1/user/workouts"
+    # important: this is the working endpoint
+    base_url = "https://api.hevyapp.com/v1/workouts"
 
     headers = {
         "accept": "application/json",
@@ -98,11 +98,9 @@ def fetch_hevy_activities_from_api(days_back: int = 30) -> pd.DataFrame:
             "pageSize": page_size,
             "since": since_iso,
         }
-
         resp = requests.get(base_url, headers=headers, params=params, timeout=15)
 
         if resp.status_code != 200:
-            # show a short error payload for debugging
             raise RuntimeError(
                 f"Hevy API error {resp.status_code}: {resp.text[:400]}"
             )
@@ -115,7 +113,6 @@ def fetch_hevy_activities_from_api(days_back: int = 30) -> pd.DataFrame:
 
         all_workouts.extend(workouts)
 
-        # stop if this is the last page
         if len(workouts) < page_size:
             break
 
@@ -135,7 +132,6 @@ def fetch_hevy_activities_from_api(days_back: int = 30) -> pd.DataFrame:
 
     rows = []
     for w in all_workouts:
-        # adjust keys if Hevy uses slightly different field names
         start = pd.to_datetime(w.get("start_time"), utc=True, errors="coerce")
         end = pd.to_datetime(w.get("end_time"), utc=True, errors="coerce")
 
@@ -158,6 +154,7 @@ def fetch_hevy_activities_from_api(days_back: int = 30) -> pd.DataFrame:
     df = pd.DataFrame(rows)
     df = df.drop_duplicates(subset=["start_time", "source"])
     return df
+
 
 def merge_activities_into_session(new_acts: pd.DataFrame):
     """Merge newly fetched activities into the main activities + daily summary."""
