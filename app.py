@@ -28,8 +28,7 @@ def init_session_state():
         st.session_state[DAILY_SUMMARY_KEY] = pd.DataFrame()
 
 
-# ------------- Hevy API -------------
-
+# ------------- Hevy API integration -------------
 
 def fetch_hevy_activities_from_api(days_back: int = 30) -> pd.DataFrame:
     """
@@ -37,12 +36,18 @@ def fetch_hevy_activities_from_api(days_back: int = 30) -> pd.DataFrame:
     activities schema used by the app:
 
       date, start_time, duration_minutes, total_calories_burned, raw_type, source
+
+    Requires in .streamlit/secrets.toml:
+
+      [hevy]
+      api_key = "YOUR_HEVY_API_KEY"
     """
     if "hevy" not in st.secrets or "api_key" not in st.secrets["hevy"]:
         raise RuntimeError("Hevy API key not configured in .streamlit/secrets.toml")
 
     api_key = st.secrets["hevy"]["api_key"]
 
+    # Base URL according to current Hevy public API docs
     base_url = "https://api.hevyapp.com/v1/workouts"
 
     headers = {
@@ -63,9 +68,11 @@ def fetch_hevy_activities_from_api(days_back: int = 30) -> pd.DataFrame:
             "pageSize": page_size,
             "since": since_iso,
         }
+
         resp = requests.get(base_url, headers=headers, params=params, timeout=15)
 
         if resp.status_code != 200:
+            # surface the first part of the response body to help debugging
             raise RuntimeError(
                 f"Hevy API error {resp.status_code}: {resp.text[:400]}"
             )
@@ -97,6 +104,7 @@ def fetch_hevy_activities_from_api(days_back: int = 30) -> pd.DataFrame:
 
     rows = []
     for w in all_workouts:
+        # Adjust keys here if Hevy changes the payload
         start = pd.to_datetime(w.get("start_time"), utc=True, errors="coerce")
         end = pd.to_datetime(w.get("end_time"), utc=True, errors="coerce")
 
@@ -110,7 +118,7 @@ def fetch_hevy_activities_from_api(days_back: int = 30) -> pd.DataFrame:
                 "date": start.date(),
                 "start_time": start,
                 "duration_minutes": dur_min,
-                "total_calories_burned": 0.0,
+                "total_calories_burned": 0.0,   # we use Hevy mainly for strength details
                 "raw_type": "strength_training",
                 "source": "hevy",
             }
@@ -146,7 +154,6 @@ def merge_activities_into_session(new_acts: pd.DataFrame):
 
 
 # ------------- Settings page -------------
-
 
 def settings_page():
     st.header("Settings")
@@ -200,14 +207,15 @@ def settings_page():
 
 # ------------- Classifier and daily summary -------------
 
-
-def classify_sessions(activities: pd.DataFrame, settings: dict) -> pd.DataFrame:
+def classify_sessions(activities: pd.DataFrame,
+                      settings: dict) -> pd.DataFrame:
     """
     Simple rule based classifier:
       - source hevy -> gym
-      - during Chile trip with no hevy -> home
-      - everything else -> functional
+      - run / cycle / ride -> cardio (for future non-Hevy sources)
+      - otherwise functional or home depending on Chile trip dates
     """
+
     if activities.empty:
         return activities
 
@@ -225,8 +233,6 @@ def classify_sessions(activities: pd.DataFrame, settings: dict) -> pd.DataFrame:
 
         if src == "hevy":
             return "gym"
-
-        # placeholder rules for future sources
         if "run" in raw_type or "cycle" in raw_type or "ride" in raw_type:
             return "cardio"
 
@@ -238,15 +244,16 @@ def classify_sessions(activities: pd.DataFrame, settings: dict) -> pd.DataFrame:
     return df
 
 
-def build_daily_summary(
-    activities: pd.DataFrame, nutrition: pd.DataFrame, settings: dict
-) -> pd.DataFrame:
+def build_daily_summary(activities: pd.DataFrame,
+                        nutrition: pd.DataFrame,
+                        settings: dict) -> pd.DataFrame:
     """
     Build one row per day:
       - calories_in, calories_out
       - training_minutes by type
       - location mode (Germany or Chile)
     """
+
     if activities.empty and nutrition.empty:
         return pd.DataFrame()
 
@@ -294,41 +301,33 @@ def build_daily_summary(
     return daily
 
 
-# ------------- Data import page (Hevy only) -------------
+# ------------- Hevy import page -------------
 
+def hevy_import_page():
+    st.header("Hevy activities (API)")
 
-def data_import_page():
-    st.header("Data import")
-
-    st.markdown("Right now this app only syncs workouts from Hevy via API.")
-
-    st.subheader("Hevy activities (API)")
-    days_hevy = st.number_input(
+    days_back = st.number_input(
         "Days to sync from Hevy",
         min_value=1,
         max_value=365,
         value=30,
         step=1,
-        key="days_hevy_api",
     )
 
     if st.button("Sync from Hevy"):
         try:
-            hevy_activities_api = fetch_hevy_activities_from_api(days_back=days_hevy)
+            hevy_df = fetch_hevy_activities_from_api(days_back)
+            merge_activities_into_session(hevy_df)
 
-            # merge into session and rebuild daily summary
-            merge_activities_into_session(hevy_activities_api)
-
-            st.success(f"Fetched {len(hevy_activities_api)} workouts from Hevy.")
-            if not hevy_activities_api.empty:
-                st.caption("Sample of latest workouts")
-                st.dataframe(hevy_activities_api.head())
+            st.success(f"Fetched {len(hevy_df)} workouts from Hevy.")
+            if not hevy_df.empty:
+                st.caption("Latest Hevy workouts (normalized)")
+                st.dataframe(hevy_df.head())
         except Exception as e:
             st.error(f"Error fetching Hevy activities: {e}")
 
 
 # ------------- Daily hub page -------------
-
 
 def daily_hub_page():
     st.header("Daily hub")
@@ -365,7 +364,6 @@ def daily_hub_page():
 
 
 # ------------- Dashboard page -------------
-
 
 def dashboard_page():
     st.header("Dashboard")
@@ -416,27 +414,7 @@ def dashboard_page():
         )
 
 
-# ------------- Future API info page -------------
-
-
-def future_api_connectors_info():
-    st.header("API connectors (future)")
-
-    st.markdown(
-        """
-        Current MVP:
-        - Hevy API for activities (gym sessions)
-
-        Future:
-        - Add Strava or Garmin for cardio
-        - Add a nutrition API (e.g. FatSecret)
-        - Pull Hevy set-level data for plateau analysis
-        """
-    )
-
-
 # ------------- Main -------------
-
 
 def main():
     st.set_page_config(page_title="Rodrigo Fitness Hub", layout="wide")
@@ -445,19 +423,17 @@ def main():
     st.sidebar.title("Navigation")
     page = st.sidebar.radio(
         "Go to",
-        ["Settings", "Data import", "Daily hub", "Dashboard", "Future APIs"],
+        ["Settings", "Hevy import", "Daily hub", "Dashboard"],
     )
 
     if page == "Settings":
         settings_page()
-    elif page == "Data import":
-        data_import_page()
+    elif page == "Hevy import":
+        hevy_import_page()
     elif page == "Daily hub":
         daily_hub_page()
     elif page == "Dashboard":
         dashboard_page()
-    else:
-        future_api_connectors_info()
 
 
 if __name__ == "__main__":
