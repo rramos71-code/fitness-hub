@@ -3,3 +3,4 @@ pandas
 numpy
 plotly
 python-dateutil
+git+https://github.com/remuzel/hevy-api.git
