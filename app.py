@@ -10,7 +10,8 @@ st.title("Fitness Hub — Core Integrations Test")
 st.header("Hevy Connection")
 if st.button("Test Hevy"):
     try:
-        client = HevyClient()
+        client = get_hevy_client()
+        response = client.get_workouts()
         data = client.get_workouts()
         st.success("Hevy connection OK")
         st.json(data[:2])

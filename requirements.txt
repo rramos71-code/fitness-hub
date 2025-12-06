@@ -6,3 +6,4 @@ google-auth
 google-auth-oauthlib
 google-auth-httplib2
 google-api-python-client
+git+https://github.com/remuzel/hevy-api.git
