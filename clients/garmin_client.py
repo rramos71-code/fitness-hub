@@ -40,11 +40,20 @@ class GarminClient:
         self.email = email
         self.password = password
 
-    def get_today_summary(self):
+    def _login(self) -> Garmin:
         client = Garmin(self.email, self.password)
+        client.login()
+        return client
+
+    def get_today_summary(self):
+        """Convenience method: summary for today."""
+        return self.get_daily_summary(date.today())
+
+    def get_daily_summary(self, day: date):
+        """This mirrors the name you used in the old app."""
+        client = self._login()
         try:
-            client.login()
-            stats = client.get_stats(date.today())
+            stats = client.get_stats(day)
         finally:
             try:
                 client.logout()
