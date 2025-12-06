@@ -49,74 +49,91 @@ class GoogleFitClient:
 
     # New helper: aggregate daily calories and macros
     def get_daily_macros(self, days_back: int = 14) -> pd.DataFrame:
-        raw = self.get_nutrition_dataset()
-        points = raw.get("point", [])
+        """
+        Aggregate daily calories and macros using the Google Fit aggregate API.
+        This will merge nutrition data from all apps (Lose It!, others, etc.)
+        that write to com.google.nutrition.
+        """
+        # Time window in milliseconds (UTC)
+        end = datetime.utcnow().replace(tzinfo=timezone.utc)
+        start = end - timedelta(days=days_back)
+        end_ms = int(end.timestamp() * 1000)
+        start_ms = int(start.timestamp() * 1000)
 
-        rows = []
+        body = {
+            "aggregateBy": [
+                {"dataTypeName": "com.google.nutrition"}
+            ],
+            "bucketByTime": {"durationMillis": 24 * 60 * 60 * 1000},  # 1 day
+            "startTimeMillis": start_ms,
+            "endTimeMillis": end_ms,
+        }
 
-        for p in points:
-            # timestamps are nanoseconds since epoch
-            start_ns = int(p.get("startTimeNanos", "0"))
-            if start_ns == 0:
-                continue
-
-            # convert to UTC date
-            ts = datetime.fromtimestamp(start_ns / 1e9, tz=timezone.utc)
-            date = ts.date()
-
-            vals = p.get("value", [])
-            if not vals:
-                continue
-
-            map_vals = vals[0].get("mapVal", [])
-
-            data = {
-                "date": date,
-                "calories_kcal": 0.0,
-                "protein_g": 0.0,
-                "carbs_g": 0.0,
-                "fat_g": 0.0,
-            }
-
-            for mv in map_vals:
-                key = mv.get("key")
-                v = mv.get("value", {})
-                val = v.get("fpVal") if "fpVal" in v else v.get("intVal")
-                if val is None:
-                    continue
-
-                if key == "nutrition.calories":
-                    data["calories_kcal"] = float(val)
-                elif key == "nutrition.protein":
-                    data["protein_g"] = float(val)
-                elif key == "nutrition.carbs.total":
-                    data["carbs_g"] = float(val)
-                elif key == "nutrition.fat.total":
-                    data["fat_g"] = float(val)
-
-            rows.append(data)
-
-        if not rows:
-            return pd.DataFrame(columns=["date", "calories_kcal", "protein_g", "carbs_g", "fat_g"])
-
-        df = pd.DataFrame(rows)
-
-        # Aggregate per day
-        agg = (
-            df.groupby("date")
-            .agg(
-                calories_kcal=("calories_kcal", "sum"),
-                protein_g=("protein_g", "sum"),
-                carbs_g=("carbs_g", "sum"),
-                fat_g=("fat_g", "sum"),
-            )
-            .reset_index()
-            .sort_values("date")
+        response = (
+            self.service.users()
+            .dataset()
+            .aggregate(userId="me", body=body)
+            .execute()
         )
 
-        # Filter to last N days
-        if days_back is not None:
-            cutoff = datetime.utcnow().date() - timedelta(days=days_back)
-            agg = agg[agg["date"] >= cutoff]
+        buckets = response.get("bucket", [])
+        rows = []
 
-        return agg
+        for b in buckets:
+            datasets = b.get("dataset", [])
+            if not datasets:
+                continue
+
+            # Each bucket should correspond to one day
+            start_time_ms = int(b.get("startTimeMillis", "0") or "0")
+            if start_time_ms == 0:
+                continue
+
+            day_dt = datetime.fromtimestamp(start_time_ms / 1000.0, tz=timezone.utc)
+            day = day_dt.date()
+
+            # Sum across all points in this bucket
+            calories = protein = carbs = fat = 0.0
+
+            for ds in datasets:
+                points = ds.get("point", [])
+                for p in points:
+                    vals = p.get("value", [])
+                    if not vals:
+                        continue
+                    map_vals = vals[0].get("mapVal", [])
+                    for mv in map_vals:
+                        key = mv.get("key")
+                        v = mv.get("value", {})
+                        val = v.get("fpVal") if "fpVal" in v else v.get("intVal")
+                        if val is None:
+                            continue
+                        val = float(val)
+                        if key == "nutrition.calories":
+                            calories += val
+                        elif key == "nutrition.protein":
+                            protein += val
+                        elif key == "nutrition.carbs.total":
+                            carbs += val
+                        elif key == "nutrition.fat.total":
+                            fat += val
+
+            # Only keep days with any data
+            if any(x > 0 for x in [calories, protein, carbs, fat]):
+                rows.append(
+                    {
+                        "date": day,
+                        "calories_kcal": calories,
+                        "protein_g": protein,
+                        "carbs_g": carbs,
+                        "fat_g": fat,
+                    }
+                )
+
+        if not rows:
+            return pd.DataFrame(
+                columns=["date", "calories_kcal", "protein_g", "carbs_g", "fat_g"]
+            )
+
+        df = pd.DataFrame(rows).sort_values("date")
+        return df
