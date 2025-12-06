@@ -7,6 +7,8 @@ from clients.googlefit_client import GoogleFitClient
 
 st.title("Fitness Hub — Core Integrations Test")
 
+# ---------------- Hevy Connect ----------------
+
 st.header("Hevy Connection")
 if st.button("Test Hevy"):
     try:
@@ -18,6 +20,7 @@ if st.button("Test Hevy"):
     except Exception as e:
         st.error(str(e))
 
+# ---------------- Garmin Connect ----------------
 
 st.header("Garmin Connection")
 if st.button("Test Garmin"):
@@ -29,14 +32,21 @@ if st.button("Test Garmin"):
     except Exception as e:
         st.error(str(e))
 
-st.header("Google Fit Connection")
-google_client = GoogleFitClient()
-service = google_client.authorize()
+# ---------------- Google Fit ----------------
 
-if service and st.button("Test Google Fit"):
+st.header("Google Fit Connection")
+
+try:
+    google_client = GoogleFitClient()
+    service = google_client.authorize()
+except Exception as e:
+    service = None
+    st.error(str(e))
+
+if service and st.button("Test Google Fit nutrition"):
     try:
         data = google_client.get_nutrition(service)
-        st.success("Google Fit connection OK")
+        st.success("Google Fit connection OK - nutrition dataset loaded")
         st.json(data)
     except Exception as e:
         st.error(str(e))
