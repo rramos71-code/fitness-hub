@@ -50,11 +50,11 @@ class GoogleFitClient:
     # New helper: aggregate daily calories and macros
     def get_daily_macros(self, days_back: int = 14) -> pd.DataFrame:
         """
-        Aggregate daily calories and macros using the Google Fit aggregate API,
-        matching the structure observed in your account (com.google.nutrition.summary
-        with keys like 'calories', 'protein', 'carbs.total', 'fat.total').
+        Aggregate daily calories and macros using the Google Fit aggregate API.
+        Uses base type com.google.nutrition (required by API) and parses the
+        returned com.google.nutrition.summary points with keys like
+        'calories', 'protein', 'carbs.total', 'fat.total'.
         """
-        # Time window in milliseconds (UTC)
         end = datetime.utcnow().replace(tzinfo=timezone.utc)
         start = end - timedelta(days=days_back)
         end_ms = int(end.timestamp() * 1000)
@@ -62,9 +62,9 @@ class GoogleFitClient:
 
         body = {
             "aggregateBy": [
-                {"dataTypeName": "com.google.nutrition.summary"}
+                {"dataTypeName": "com.google.nutrition"}  # <- important
             ],
-            "bucketByTime": {"durationMillis": 24 * 60 * 60 * 1000},  # 1 day
+            "bucketByTime": {"durationMillis": 24 * 60 * 60 * 1000},
             "startTimeMillis": start_ms,
             "endTimeMillis": end_ms,
         }
@@ -84,7 +84,6 @@ class GoogleFitClient:
             if not datasets:
                 continue
 
-            # One bucket = one day
             start_time_ms = int(b.get("startTimeMillis", "0") or "0")
             if start_time_ms == 0:
                 continue
@@ -109,7 +108,7 @@ class GoogleFitClient:
                             continue
                         val = float(val)
 
-                        # Support both plain and "nutrition." prefixed keys
+                        # Your keys
                         if key in ("calories", "nutrition.calories"):
                             calories += val
                         elif key in ("protein", "nutrition.protein"):
@@ -119,7 +118,6 @@ class GoogleFitClient:
                         elif key in ("fat.total", "nutrition.fat.total"):
                             fat += val
 
-            # Only keep days with any non-zero data
             if any(x > 0 for x in [calories, protein, carbs, fat]):
                 rows.append(
                     {
@@ -136,8 +134,7 @@ class GoogleFitClient:
                 columns=["date", "calories_kcal", "protein_g", "carbs_g", "fat_g"]
             )
 
-        df = pd.DataFrame(rows).sort_values("date")
-        return df
+        return pd.DataFrame(rows).sort_values("date")
 
     def debug_aggregate_raw(self, days_back: int = 3):
         """
