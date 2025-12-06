@@ -1,44 +1,32 @@
 import os
-
 import streamlit as st
+from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
-import google_auth_oauthlib.flow
 
 SCOPES = ["https://www.googleapis.com/auth/fitness.nutrition.read"]
 
 
 class GoogleFitClient:
     def __init__(self):
-        # Only use top-level secrets or env, to avoid old values under [fitness_hub]
-        client_id = st.secrets.get("GOOGLE_FIT_CLIENT_ID") or os.getenv("GOOGLE_FIT_CLIENT_ID")
-        client_secret = st.secrets.get("GOOGLE_FIT_CLIENT_SECRET") or os.getenv("GOOGLE_FIT_CLIENT_SECRET")
-
-        if not client_id or not client_secret:
-            raise RuntimeError(
-                "Google Fit client id or secret missing. "
-                "Set GOOGLE_FIT_CLIENT_ID and GOOGLE_FIT_CLIENT_SECRET in Streamlit secrets."
-            )
-
-        self.client_id = client_id
-        self.client_secret = client_secret
+        self.client_id = st.secrets["GOOGLE_FIT_CLIENT_ID"]
+        self.client_secret = st.secrets["GOOGLE_FIT_CLIENT_SECRET"]
+        self.redirect_uri = st.secrets.get("GOOGLE_FIT_REDIRECT_URI", "http://localhost")
 
     def authorize(self):
-        # Explicit desktop / installed config
-        flow = google_auth_oauthlib.flow.Flow.from_client_config(
+        flow = Flow.from_client_config(
             {
                 "installed": {
                     "client_id": self.client_id,
                     "client_secret": self.client_secret,
-                    "redirect_uris": ["urn:ietf:wg:oauth:2.0:oob"],
                     "auth_uri": "https://accounts.google.com/o/oauth2/auth",
                     "token_uri": "https://oauth2.googleapis.com/token",
+                    "redirect_uris": [self.redirect_uri],
                 }
             },
             scopes=SCOPES,
         )
 
-        # Explicitly set redirect_uri so Google gets it
-        flow.redirect_uri = "urn:ietf:wg:oauth:2.0:oob"
+        flow.redirect_uri = self.redirect_uri
 
         auth_url, _ = flow.authorization_url(
             access_type="offline",
@@ -46,9 +34,16 @@ class GoogleFitClient:
             prompt="consent",
         )
 
-        st.write("1. Open this link and authorize Google Fit:")
-        st.write(auth_url)
-        code = st.text_input("2. Paste the authorization code here", key="google_fit_code")
+        st.write("### 1. Click to authorize Google Fit:")
+        st.link_button("Authorize Google Fit", auth_url)
+
+        st.write("""
+        ### 2. After logging in, Google will try to redirect to `http://localhost`  
+        This will fail to load, but the **URL will contain `?code=XYZ`**.  
+        Copy that code and paste it below.
+        """)
+
+        code = st.text_input("Paste the `code` value here:")
 
         if not code:
             return None
@@ -60,15 +55,15 @@ class GoogleFitClient:
             return None
 
         credentials = flow.credentials
-        service = build("fitness", "v1", credentials=credentials)
-        return service
+        return build("fitness", "v1", credentials=credentials)
 
     def get_nutrition(self, service):
-        data_source = "derived:com.google.nutrition.summary:com.google.android.gms:merge_nutrition"
-        dataset = "0-{}".format(10**18)
+        datasource = "derived:com.google.nutrition.summary:com.google.android.gms:merge_nutrition"
+        dataset = f"0-{10**18}"
+
         request = service.users().dataSources().datasets().get(
             userId="me",
-            dataSourceId=data_source,
-            datasetId=dataset,
+            dataSourceId=datasource,
+            datasetId=dataset
         )
         return request.execute()
