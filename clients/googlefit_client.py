@@ -50,9 +50,9 @@ class GoogleFitClient:
     # New helper: aggregate daily calories and macros
     def get_daily_macros(self, days_back: int = 14) -> pd.DataFrame:
         """
-        Aggregate daily calories and macros using the Google Fit aggregate API.
-        This will merge nutrition data from all apps (Lose It!, others, etc.)
-        that write to com.google.nutrition.
+        Aggregate daily calories and macros using the Google Fit aggregate API,
+        matching the structure observed in your account (com.google.nutrition.summary
+        with keys like 'calories', 'protein', 'carbs.total', 'fat.total').
         """
         # Time window in milliseconds (UTC)
         end = datetime.utcnow().replace(tzinfo=timezone.utc)
@@ -62,7 +62,7 @@ class GoogleFitClient:
 
         body = {
             "aggregateBy": [
-                {"dataTypeName": "com.google.nutrition"}
+                {"dataTypeName": "com.google.nutrition.summary"}
             ],
             "bucketByTime": {"durationMillis": 24 * 60 * 60 * 1000},  # 1 day
             "startTimeMillis": start_ms,
@@ -84,7 +84,7 @@ class GoogleFitClient:
             if not datasets:
                 continue
 
-            # Each bucket should correspond to one day
+            # One bucket = one day
             start_time_ms = int(b.get("startTimeMillis", "0") or "0")
             if start_time_ms == 0:
                 continue
@@ -92,7 +92,6 @@ class GoogleFitClient:
             day_dt = datetime.fromtimestamp(start_time_ms / 1000.0, tz=timezone.utc)
             day = day_dt.date()
 
-            # Sum across all points in this bucket
             calories = protein = carbs = fat = 0.0
 
             for ds in datasets:
@@ -109,16 +108,18 @@ class GoogleFitClient:
                         if val is None:
                             continue
                         val = float(val)
-                        if key == "nutrition.calories":
+
+                        # Support both plain and "nutrition." prefixed keys
+                        if key in ("calories", "nutrition.calories"):
                             calories += val
-                        elif key == "nutrition.protein":
+                        elif key in ("protein", "nutrition.protein"):
                             protein += val
-                        elif key == "nutrition.carbs.total":
+                        elif key in ("carbs.total", "nutrition.carbs.total"):
                             carbs += val
-                        elif key == "nutrition.fat.total":
+                        elif key in ("fat.total", "nutrition.fat.total"):
                             fat += val
 
-            # Only keep days with any data
+            # Only keep days with any non-zero data
             if any(x > 0 for x in [calories, protein, carbs, fat]):
                 rows.append(
                     {
