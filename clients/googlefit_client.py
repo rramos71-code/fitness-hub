@@ -7,6 +7,9 @@ from googleapiclient.discovery import build
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 
+from zoneinfo import ZoneInfo
+
+
 SCOPES = ["https://www.googleapis.com/auth/fitness.nutrition.read"]
 
 
@@ -55,16 +58,23 @@ class GoogleFitClient:
         returned com.google.nutrition.summary points with keys like
         'calories', 'protein', 'carbs.total', 'fat.total'.
         """
-        end = datetime.utcnow().replace(tzinfo=timezone.utc)
-        start = end - timedelta(days=days_back)
-        end_ms = int(end.timestamp() * 1000)
-        start_ms = int(start.timestamp() * 1000)
+        tz = ZoneInfo("Europe/Berlin")  # your local TZ
+
+        # End = now in local time, start = N days back in local time
+        end_local = datetime.now(tz=tz)
+        start_local = end_local - timedelta(days=days_back)
+
+        end_ms = int(end_local.timestamp() * 1000)
+        start_ms = int(start_local.timestamp() * 1000)
 
         body = {
             "aggregateBy": [
-                {"dataTypeName": "com.google.nutrition"}  # <- important
+                {"dataTypeName": "com.google.nutrition"}
             ],
-            "bucketByTime": {"durationMillis": 24 * 60 * 60 * 1000},
+            "bucketByTime": {
+                "durationMillis": 24 * 60 * 60 * 1000,
+                "timeZoneId": "Europe/Berlin",  # <- key line
+            },
             "startTimeMillis": start_ms,
             "endTimeMillis": end_ms,
         }
@@ -80,54 +90,44 @@ class GoogleFitClient:
         rows = []
 
         for b in buckets:
-            datasets = b.get("dataset", [])
-            if not datasets:
-                continue
-
+            # Extract start time of the bucket in ms
             start_time_ms = int(b.get("startTimeMillis", "0") or "0")
             if start_time_ms == 0:
                 continue
 
-            day_dt = datetime.fromtimestamp(start_time_ms / 1000.0, tz=timezone.utc)
+            # Convert bucket start into your local timezone (Europe/Berlin)
+            day_dt = datetime.fromtimestamp(start_time_ms / 1000.0, tz=tz)
             day = day_dt.date()
 
+            # Default values
             calories = protein = carbs = fat = 0.0
 
-            for ds in datasets:
-                points = ds.get("point", [])
-                for p in points:
-                    vals = p.get("value", [])
-                    if not vals:
-                        continue
-                    map_vals = vals[0].get("mapVal", [])
-                    for mv in map_vals:
-                        key = mv.get("key")
-                        v = mv.get("value", {})
-                        val = v.get("fpVal") if "fpVal" in v else v.get("intVal")
-                        if val is None:
-                            continue
-                        val = float(val)
+            # Read all datasets in the bucket
+            for dataset in b.get("dataset", []):
+                for point in dataset.get("point", []):
+                    for val in point.get("value", []):
+                        # Nutrition is encoded as mapVal
+                        for m in val.get("mapVal", []):
+                            key = m.get("key")
+                            v = m.get("value", {}).get("fpVal", 0)
 
-                        # Your keys
-                        if key in ("calories", "nutrition.calories"):
-                            calories += val
-                        elif key in ("protein", "nutrition.protein"):
-                            protein += val
-                        elif key in ("carbs.total", "nutrition.carbs.total"):
-                            carbs += val
-                        elif key in ("fat.total", "nutrition.fat.total"):
-                            fat += val
+                            if key == "calories":
+                                calories = v
+                            elif key == "protein":
+                                protein = v
+                            elif key == "carbs.total":
+                                carbs = v
+                            elif key == "fat.total":
+                                fat = v
 
-            if any(x > 0 for x in [calories, protein, carbs, fat]):
-                rows.append(
-                    {
-                        "date": day,
-                        "calories_kcal": calories,
-                        "protein_g": protein,
-                        "carbs_g": carbs,
-                        "fat_g": fat,
-                    }
-                )
+            # Append even if calories/macros are zero
+            rows.append({
+                "date": str(day),
+                "calories_kcal": calories,
+                "protein_g": protein,
+                "carbs_g": carbs,
+                "fat_g": fat,
+            })
 
         if not rows:
             return pd.DataFrame(
