@@ -137,3 +137,32 @@ class GoogleFitClient:
 
         df = pd.DataFrame(rows).sort_values("date")
         return df
+
+
+    def debug_aggregate_raw(self, days_back: int = 3):
+        """
+        Call the aggregate API and return the raw response
+        so we can inspect the structure (data types, keys, etc.).
+        """
+        end = datetime.utcnow().replace(tzinfo=timezone.utc)
+        start = end - timedelta(days=days_back)
+        end_ms = int(end.timestamp() * 1000)
+        start_ms = int(start.timestamp() * 1000)
+
+        body = {
+            "aggregateBy": [
+                {"dataTypeName": "com.google.nutrition"}
+            ],
+            "bucketByTime": {"durationMillis": 24 * 60 * 60 * 1000},
+            "startTimeMillis": start_ms,
+            "endTimeMillis": end_ms,
+        }
+
+        response = (
+            self.service.users()
+            .dataset()
+            .aggregate(userId="me", body=body)
+            .execute()
+        )
+
+        return response
