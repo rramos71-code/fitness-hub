@@ -1,34 +1,29 @@
+import os
+
 import streamlit as st
 from googleapiclient.discovery import build
 import google_auth_oauthlib.flow
-import os
-
-from utils.secrets import get_secret
 
 SCOPES = ["https://www.googleapis.com/auth/fitness.nutrition.read"]
 
 
 class GoogleFitClient:
     def __init__(self):
-        # Look in [fitness_hub] first, then top level, then env
-        client_id = get_secret("google_fit_client_id") or st.secrets.get("GOOGLE_FIT_CLIENT_ID")
-        client_secret = get_secret("google_fit_client_secret") or st.secrets.get("GOOGLE_FIT_CLIENT_SECRET")
-
-        client_id = client_id or os.getenv("GOOGLE_FIT_CLIENT_ID")
-        client_secret = client_secret or os.getenv("GOOGLE_FIT_CLIENT_SECRET")
+        # Only use top-level secrets or env, to avoid old values under [fitness_hub]
+        client_id = st.secrets.get("GOOGLE_FIT_CLIENT_ID") or os.getenv("GOOGLE_FIT_CLIENT_ID")
+        client_secret = st.secrets.get("GOOGLE_FIT_CLIENT_SECRET") or os.getenv("GOOGLE_FIT_CLIENT_SECRET")
 
         if not client_id or not client_secret:
             raise RuntimeError(
                 "Google Fit client id or secret missing. "
-                "Set google_fit_client_id and google_fit_client_secret under [fitness_hub] "
-                "or GOOGLE_FIT_CLIENT_ID and GOOGLE_FIT_CLIENT_SECRET at top level."
+                "Set GOOGLE_FIT_CLIENT_ID and GOOGLE_FIT_CLIENT_SECRET in Streamlit secrets."
             )
 
         self.client_id = client_id
         self.client_secret = client_secret
 
     def authorize(self):
-        # Installed app style config (shows code you copy paste)
+        # Explicit desktop / installed config
         flow = google_auth_oauthlib.flow.Flow.from_client_config(
             {
                 "installed": {
@@ -42,7 +37,14 @@ class GoogleFitClient:
             scopes=SCOPES,
         )
 
-        auth_url, _ = flow.authorization_url(prompt="consent")
+        # Explicitly set redirect_uri so Google gets it
+        flow.redirect_uri = "urn:ietf:wg:oauth:2.0:oob"
+
+        auth_url, _ = flow.authorization_url(
+            access_type="offline",
+            include_granted_scopes="true",
+            prompt="consent",
+        )
 
         st.write("1. Open this link and authorize Google Fit:")
         st.write(auth_url)
