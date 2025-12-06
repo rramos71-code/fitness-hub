@@ -1,14 +1,12 @@
 import json
-from datetime import datetime, timedelta, timezone
-
-import streamlit as st
-import pandas as pd
-from googleapiclient.discovery import build
-from google.oauth2.credentials import Credentials
-from google.auth.transport.requests import Request
-
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
+import pandas as pd
+import streamlit as st
+from google.oauth2.credentials import Credentials
+from google.auth.transport.requests import Request
+from googleapiclient.discovery import build
 
 SCOPES = ["https://www.googleapis.com/auth/fitness.nutrition.read"]
 
@@ -30,7 +28,6 @@ class GoogleFitClient:
         info.setdefault("client_secret", client_secret)
 
         creds = Credentials.from_authorized_user_info(info, scopes=SCOPES)
-
         if not creds.valid:
             if creds.expired and creds.refresh_token:
                 creds.refresh(Request())
@@ -39,29 +36,18 @@ class GoogleFitClient:
 
         self.service = build("fitness", "v1", credentials=creds)
 
-    # Raw dataset, like you already tested
-    def get_nutrition_dataset(self):
-        data_source = "derived:com.google.nutrition.summary:com.google.android.gms:merge_nutrition"
-        dataset = f"0-{10**18}"
-        request = self.service.users().dataSources().datasets().get(
-            userId="me",
-            dataSourceId=data_source,
-            datasetId=dataset,
-        )
-        return request.execute()
-
-    # New helper: aggregate daily calories and macros
     def get_daily_macros(self, days_back: int = 14) -> pd.DataFrame:
         """
-        Aggregate daily calories and macros using the Google Fit aggregate API.
-        Uses base type com.google.nutrition (required by API) and parses the
-        returned com.google.nutrition.summary points with keys like
-        'calories', 'protein', 'carbs.total', 'fat.total'.
-        """
-        tz = ZoneInfo("Europe/Berlin")  # your local TZ
+        Aggregate daily calories and macros via Google Fit aggregate API.
 
-        # End = now in local time, start = N days back in local time
-        end_local = datetime.now(tz=tz)
+        - Uses com.google.nutrition as base type
+        - Buckets by 1 day in Europe/Berlin
+        - Sums all points in each bucket
+        - Looks for keys: calories, protein, carbs.total, fat.total
+        """
+        tz = ZoneInfo("Europe/Berlin")
+
+        end_local = datetime.now(tz)
         start_local = end_local - timedelta(days=days_back)
 
         end_ms = int(end_local.timestamp() * 1000)
@@ -73,7 +59,7 @@ class GoogleFitClient:
             ],
             "bucketByTime": {
                 "durationMillis": 24 * 60 * 60 * 1000,
-                "timeZoneId": "Europe/Berlin",  # <- key line
+                "timeZoneId": "Europe/Berlin",
             },
             "startTimeMillis": start_ms,
             "endTimeMillis": end_ms,
@@ -90,76 +76,53 @@ class GoogleFitClient:
         rows = []
 
         for b in buckets:
-            # Extract start time of the bucket in ms
             start_time_ms = int(b.get("startTimeMillis", "0") or "0")
             if start_time_ms == 0:
                 continue
 
-            # Convert bucket start into your local timezone (Europe/Berlin)
+            # Day boundary in your local timezone
             day_dt = datetime.fromtimestamp(start_time_ms / 1000.0, tz=tz)
             day = day_dt.date()
 
-            # Default values
             calories = protein = carbs = fat = 0.0
 
-            # Read all datasets in the bucket
-            for dataset in b.get("dataset", []):
-                for point in dataset.get("point", []):
-                    for val in point.get("value", []):
-                        # Nutrition is encoded as mapVal
-                        for m in val.get("mapVal", []):
-                            key = m.get("key")
-                            v = m.get("value", {}).get("fpVal", 0)
+            for ds in b.get("dataset", []):
+                for p in ds.get("point", []):
+                    for val in p.get("value", []):
+                        for mv in val.get("mapVal", []):
+                            key = mv.get("key")
+                            v = mv.get("value", {})
+                            raw = v.get("fpVal") if "fpVal" in v else v.get("intVal")
+                            if raw is None:
+                                continue
+                            value = float(raw)
 
-                            if key == "calories":
-                                calories = v
-                            elif key == "protein":
-                                protein = v
-                            elif key == "carbs.total":
-                                carbs = v
-                            elif key == "fat.total":
-                                fat = v
+                            # Your observed keys (plus optional nutrition.* variants)
+                            if key in ("calories", "nutrition.calories"):
+                                calories += value
+                            elif key in ("protein", "nutrition.protein"):
+                                protein += value
+                            elif key in ("carbs.total", "nutrition.carbs.total"):
+                                carbs += value
+                            elif key in ("fat.total", "nutrition.fat.total"):
+                                fat += value
 
-            # Append even if calories/macros are zero
-            rows.append({
-                "date": str(day),
-                "calories_kcal": calories,
-                "protein_g": protein,
-                "carbs_g": carbs,
-                "fat_g": fat,
-            })
+            # Keep only days that actually have some macro data
+            if any(x > 0 for x in (calories, protein, carbs, fat)):
+                rows.append(
+                    {
+                        "date": day,
+                        "calories_kcal": calories,
+                        "protein_g": protein,
+                        "carbs_g": carbs,
+                        "fat_g": fat,
+                    }
+                )
 
         if not rows:
             return pd.DataFrame(
                 columns=["date", "calories_kcal", "protein_g", "carbs_g", "fat_g"]
             )
 
-        return pd.DataFrame(rows).sort_values("date")
-
-    def debug_aggregate_raw(self, days_back: int = 3):
-        """
-        Call the aggregate API and return the raw response
-        so we can inspect the structure (data types, keys, etc.).
-        """
-        end = datetime.utcnow().replace(tzinfo=timezone.utc)
-        start = end - timedelta(days=days_back)
-        end_ms = int(end.timestamp() * 1000)
-        start_ms = int(start.timestamp() * 1000)
-
-        body = {
-            "aggregateBy": [
-                {"dataTypeName": "com.google.nutrition"}
-            ],
-            "bucketByTime": {"durationMillis": 24 * 60 * 60 * 1000},
-            "startTimeMillis": start_ms,
-            "endTimeMillis": end_ms,
-        }
-
-        response = (
-            self.service.users()
-            .dataset()
-            .aggregate(userId="me", body=body)
-            .execute()
-        )
-
-        return response
+        df = pd.DataFrame(rows).sort_values("date").reset_index(drop=True)
+        return df
