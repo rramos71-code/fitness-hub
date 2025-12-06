@@ -36,16 +36,10 @@ if st.button("Test Garmin"):
 
 st.header("Google Fit Connection")
 
-try:
-    google_client = GoogleFitClient()
-    service = google_client.authorize()
-except Exception as e:
-    service = None
-    st.error(str(e))
-
-if service and st.button("Test Google Fit nutrition"):
+if st.button("Test Google Fit nutrition"):
     try:
-        data = google_client.get_nutrition(service)
+        gf = GoogleFitClient()
+        data = gf.get_nutrition()
         st.success("Google Fit connection OK - nutrition dataset loaded")
         st.json(data)
     except Exception as e:
