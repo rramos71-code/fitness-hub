@@ -50,10 +50,11 @@ class GarminClient:
         return self.get_daily_summary(date.today())
 
     def get_daily_summary(self, day: date):
-        """This mirrors the name you used in the old app."""
+        """Garmin expects the date as 'YYYY-MM-DD' string."""
         client = self._login()
         try:
-            stats = client.get_stats(day)
+            day_str = day.isoformat()  # convert date -> "YYYY-MM-DD"
+            stats = client.get_stats(day_str)
         finally:
             try:
                 client.logout()
