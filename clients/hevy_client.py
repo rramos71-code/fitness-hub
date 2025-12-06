@@ -1,7 +1,7 @@
 import requests
 from utils.secrets import get_secret
 
-BASE_URL = "https://api.hevyapp.com/v1"
+BASE_URL = "https://hevy.com/api/v1"
 
 class HevyClient:
     def __init__(self):
