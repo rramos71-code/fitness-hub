@@ -43,10 +43,11 @@ class GoogleFitClient:
         - Uses com.google.nutrition as base type
         - Buckets by 1 day in Europe/Berlin
         - Sums all points in each bucket
-        - Looks for keys: calories, protein, carbs.total, fat.total
+        - Only counts entries coming from Lose It (originDataSourceId contains 'com.fitnow.loseit')
         """
         tz = ZoneInfo("Europe/Berlin")
 
+        # Use local time boundaries so buckets align with what you see in the app
         end_local = datetime.now(tz)
         start_local = end_local - timedelta(days=days_back)
 
@@ -80,7 +81,7 @@ class GoogleFitClient:
             if start_time_ms == 0:
                 continue
 
-            # Day boundary in your local timezone
+            # convert bucket start to local calendar date
             day_dt = datetime.fromtimestamp(start_time_ms / 1000.0, tz=tz)
             day = day_dt.date()
 
@@ -88,8 +89,9 @@ class GoogleFitClient:
 
             for ds in b.get("dataset", []):
                 for p in ds.get("point", []):
-                    # Only keep nutrition logged via Lose It
                     origin = p.get("originDataSourceId", "")
+
+                    # keep only Lose It entries
                     if "com.fitnow.loseit" not in origin:
                         continue
 
@@ -110,6 +112,18 @@ class GoogleFitClient:
                                 carbs += value
                             elif key in ("fat.total", "nutrition.fat.total"):
                                 fat += value
+
+            # only add rows that actually have some macro data
+            if any(x > 0 for x in (calories, protein, carbs, fat)):
+                rows.append(
+                    {
+                        "date": day,
+                        "calories_kcal": calories,
+                        "protein_g": protein,
+                        "carbs_g": carbs,
+                        "fat_g": fat,
+                    }
+                )
 
         if not rows:
             return pd.DataFrame(
