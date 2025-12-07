@@ -1,5 +1,5 @@
 import streamlit as st
-from datetime import date, datetime, timezone
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -10,26 +10,54 @@ from clients.garmin_client import GarminClient
 from clients.googlefit_client import GoogleFitClient
 from utils.daily_aggregation import build_daily_dataset
 
-# ---------------------------------------------------------
-# Instantiate API clients (simple and safe, no NameErrors)
-# ---------------------------------------------------------
-hevy_client = HevyClient()
-garmin_client = GarminClient()
-gf_client = GoogleFitClient()
+# =========================================================
+# Client initialisation (safe, via session_state)
+# =========================================================
 
-# ---------------------------------------------------------
-# Helper: Google Fit raw -> daily macros (kept here for now)
-# ---------------------------------------------------------
+def init_clients():
+    # -------- Hevy --------
+    if "hevy_client" not in st.session_state and "hevy_client_error" not in st.session_state:
+        try:
+            st.session_state["hevy_client"] = HevyClient()
+        except Exception as e:
+            st.session_state["hevy_client"] = None
+            st.session_state["hevy_client_error"] = str(e)
+
+    # -------- Garmin --------
+    if "garmin_client" not in st.session_state and "garmin_client_error" not in st.session_state:
+        try:
+            st.session_state["garmin_client"] = GarminClient()
+        except Exception as e:
+            st.session_state["garmin_client"] = None
+            st.session_state["garmin_client_error"] = str(e)
+
+    # -------- Google Fit --------
+    if "gf_client" not in st.session_state and "gf_client_error" not in st.session_state:
+        try:
+            st.session_state["gf_client"] = GoogleFitClient()
+        except Exception as e:
+            st.session_state["gf_client"] = None
+            st.session_state["gf_client_error"] = str(e)
+
+
+init_clients()
+
+hevy_client = st.session_state.get("hevy_client")
+garmin_client = st.session_state.get("garmin_client")
+gf_client = st.session_state.get("gf_client")
+
+hevy_err = st.session_state.get("hevy_client_error")
+garmin_err = st.session_state.get("garmin_client_error")
+gf_err = st.session_state.get("gf_client_error")
+
+# =========================================================
+# (Optional) helper if you still want raw → df conversion
+# =========================================================
+
 def aggregate_googlefit_macros(raw: dict, tz_name: str = "Europe/Berlin"):
     """
     Turn raw Google Fit aggregate JSON into a daily macros DataFrame.
-
-    Logic:
-    - Iterate over all buckets and all points.
-    - Use endTimeNanos to decide which local calendar date a point belongs to.
-    - Aggregate calories, protein, carbs and fat per date.
-    - No filtering by app (LoseIt, Cronometer, etc) so any app that writes
-      com.google.nutrition.summary is included.
+    (not used by main flow now, but kept for debugging if needed)
     """
     tz = ZoneInfo(tz_name)
     per_day = {}  # date -> dict with totals
@@ -37,10 +65,8 @@ def aggregate_googlefit_macros(raw: dict, tz_name: str = "Europe/Berlin"):
     for b in raw.get("bucket", []):
         for ds in b.get("dataset", []):
             for p in ds.get("point", []):
-                # Decide which day this point belongs to
                 end_ns = int(p.get("endTimeNanos", "0") or "0")
                 if end_ns == 0:
-                    # Fallback: bucket start if endTimeNanos is missing
                     start_ms = int(b.get("startTimeMillis", "0") or "0")
                     if start_ms == 0:
                         continue
@@ -59,7 +85,6 @@ def aggregate_googlefit_macros(raw: dict, tz_name: str = "Europe/Berlin"):
                         "fat_g": 0.0,
                     }
 
-                # Sum macro values
                 for val in p.get("value", []):
                     for mv in val.get("mapVal", []):
                         key = mv.get("key")
@@ -83,77 +108,100 @@ def aggregate_googlefit_macros(raw: dict, tz_name: str = "Europe/Berlin"):
             columns=["date", "calories_kcal", "protein_g", "carbs_g", "fat_g"]
         )
 
-    rows = []
-    for d, totals in per_day.items():
-        rows.append({"date": d, **totals})
-
+    rows = [{"date": d, **totals} for d, totals in per_day.items()]
     df = pd.DataFrame(rows).sort_values("date").reset_index(drop=True)
     return df
 
-# ---------------------------------------------------------
+
+# =========================================================
 # UI
-# ---------------------------------------------------------
+# =========================================================
+
 st.title("Fitness Hub — Core Integrations Test")
 
-# ======================= Hevy ============================
+# ----------------------- Hevy ----------------------------
+
 st.header("Hevy Connection")
 
+if hevy_err:
+    st.warning(f"Hevy client not available: {hevy_err}")
+
 if st.button("Sync Hevy workouts"):
-    try:
-        workouts_df, sets_df = hevy_client.sync_workouts()
-        st.session_state["hevy_sets_df"] = sets_df
+    if hevy_client is None:
+        st.error("Hevy client not initialised. Check your HEVY_API_KEY configuration.")
+    else:
+        try:
+            workouts_df, sets_df = hevy_client.sync_workouts()
+            st.session_state["hevy_sets_df"] = sets_df
 
-        st.success(f"Hevy connection OK, {len(workouts_df)} workouts retrieved")
-        st.subheader("Hevy sets (sample)")
-        st.dataframe(sets_df.head())
-    except Exception as e:
-        st.error(f"Hevy error: {e}")
+            st.success(f"Hevy connection OK, {len(workouts_df)} workouts retrieved")
+            st.subheader("Hevy sets (sample)")
+            st.dataframe(sets_df.head())
+        except Exception as e:
+            st.error(f"Hevy error: {e}")
 
-# ======================= Garmin ==========================
+# ----------------------- Garmin --------------------------
+
 st.header("Garmin Connection")
 
+if garmin_err:
+    st.warning(f"Garmin client not available: {garmin_err}")
+
 if st.button("Test Garmin"):
-    try:
-        daily_df, activities_df = garmin_client.fetch_daily_and_activities()
-        st.session_state["garmin_daily_df"] = daily_df
-        st.session_state["garmin_activities_df"] = activities_df
+    if garmin_client is None:
+        st.error("Garmin client not initialised. Check GARMIN_EMAIL / GARMIN_PASSWORD.")
+    else:
+        try:
+            daily_df, activities_df = garmin_client.fetch_daily_and_activities()
+            st.session_state["garmin_daily_df"] = daily_df
+            st.session_state["garmin_activities_df"] = activities_df
 
-        st.write("Daily")
-        st.dataframe(daily_df.head())
+            st.write("Daily")
+            st.dataframe(daily_df.head())
 
-        st.write("Activities")
-        st.dataframe(activities_df.head())
-    except Exception as e:
-        st.error(f"Garmin error: {e}")
+            st.write("Activities")
+            st.dataframe(activities_df.head())
+        except Exception as e:
+            st.error(f"Garmin error: {e}")
 
-# ======================= Google Fit ======================
+# ----------------------- Google Fit ----------------------
+
 st.header("Google Fit Connection")
+
+if gf_err:
+    st.warning(f"Google Fit client not available: {gf_err}")
 
 days_back = st.number_input(
     "Days back", min_value=1, max_value=30, value=7, step=1
 )
 
 if st.button("Test Google Fit nutrition"):
-    try:
-        # Use days_back directly
-        df = gf_client.aggregate_daily_macros(days_back=days_back)
-        st.session_state["googlefit_nutrition_df"] = df
+    if gf_client is None:
+        st.error("Google Fit client not initialised. Check your Google Fit secrets.")
+    else:
+        try:
+            df = gf_client.aggregate_daily_macros(days_back=days_back)
+            st.session_state["googlefit_nutrition_df"] = df
 
-        if df.empty:
-            st.info("Google Fit returned no nutrition entries for the selected period.")
-        else:
-            st.dataframe(df)
-    except Exception as e:
-        st.error(f"Google Fit error: {e}")
+            if df.empty:
+                st.info("Google Fit returned no nutrition entries for the selected period.")
+            else:
+                st.dataframe(df)
+        except Exception as e:
+            st.error(f"Google Fit error: {e}")
 
 if st.button("Debug raw Google Fit aggregate response"):
-    try:
-        raw = gf_client.debug_aggregate_raw(days_back=days_back)
-        st.json(raw)
-    except Exception as e:
-        st.error(f"Google Fit debug error: {e}")
+    if gf_client is None:
+        st.error("Google Fit client not initialised. Check your Google Fit secrets.")
+    else:
+        try:
+            raw = gf_client.debug_aggregate_raw(days_back=days_back)
+            st.json(raw)
+        except Exception as e:
+            st.error(f"Google Fit debug error: {e}")
 
-# =================== Unified daily view ==================
+# -------------------- Unified daily view -----------------
+
 st.subheader("Daily overview (unified dataset)")
 
 nutrition_df = st.session_state.get("googlefit_nutrition_df")
