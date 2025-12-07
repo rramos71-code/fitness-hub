@@ -108,8 +108,6 @@ from clients.googlefit_client import GoogleFitClient
 
 st.header("Google Fit Connection")
 
-from google_fit_client import GoogleFitClient
-
 # inside your Streamlit layout
 days_back = st.number_input("Days back", min_value=1, max_value=30, value=7, step=1)
 
