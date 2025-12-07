@@ -58,10 +58,8 @@ with col2:
 
 # Debug button
 if st.button("Debug raw Google Fit aggregate response"):
-    try:
-        gf = GoogleFitClient()
-        raw = gf.debug_aggregate_raw(days_back=7)
-        st.json(raw)
-    except Exception as e:
-        st.error(str(e))
+    client = GoogleFitClient()
+    raw = client.debug_aggregate_raw(days_back=days_back)
+    st.json(raw)
+
 
