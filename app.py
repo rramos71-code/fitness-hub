@@ -8,39 +8,54 @@ from clients.googlefit_client import GoogleFitClient
 st.title("Fitness Hub — Core Integrations Test")
 
 from zoneinfo import ZoneInfo
-from datetime import datetime
+from datetime import datetime, timezone
 
 def aggregate_googlefit_macros(raw: dict, tz_name: str = "Europe/Berlin"):
     """
-    Turn the raw Google Fit aggregate JSON into a daily macros DataFrame.
+    Turn raw Google Fit aggregate JSON into a daily macros DataFrame.
 
-    - Uses the bucket start time as the calendar date
-    - Only counts nutrition coming from Lose It (originDataSourceId contains 'com.fitnow.loseit')
+    Logic:
+    - Iterate over all buckets and all points.
+    - Use endTimeNanos to decide which local calendar date a point belongs to.
+    - Aggregate calories, protein, carbs and fat per date.
+    - No filtering by app (LoseIt, Cronometer, etc) so any app that writes
+      com.google.nutrition.summary is included.
     """
     import pandas as pd
 
     tz = ZoneInfo(tz_name)
-    rows = []
+    per_day = {}  # date -> dict with totals
 
     for b in raw.get("bucket", []):
-        # bucket start -> local date
-        start_ms = int(b.get("startTimeMillis", "0") or "0")
-        if start_ms == 0:
-            continue
-
-        day_dt = datetime.fromtimestamp(start_ms / 1000.0, tz=tz)
-        day = day_dt.date()
-
-        calories = protein = carbs = fat = 0.0
-
         for ds in b.get("dataset", []):
             for p in ds.get("point", []):
                 origin = p.get("originDataSourceId", "")
 
-                # only Lose It entries
-                if "com.fitnow.loseit" not in origin:
-                    continue
+                # (we no longer filter on origin, so Cronometer, LoseIt, manual Fit input etc are all included)
 
+                # Decide which day this point belongs to
+                end_ns = int(p.get("endTimeNanos", "0") or "0")
+                if end_ns == 0:
+                    # Fallback: bucket start if endTimeNanos is missing
+                    start_ms = int(b.get("startTimeMillis", "0") or "0")
+                    if start_ms == 0:
+                        continue
+                    dt_local = datetime.fromtimestamp(start_ms / 1000.0, tz=tz)
+                else:
+                    dt_utc = datetime.fromtimestamp(end_ns / 1e9, tz=timezone.utc)
+                    dt_local = dt_utc.astimezone(tz)
+
+                day = dt_local.date()
+
+                if day not in per_day:
+                    per_day[day] = {
+                        "calories_kcal": 0.0,
+                        "protein_g": 0.0,
+                        "carbs_g": 0.0,
+                        "fat_g": 0.0,
+                    }
+
+                # Sum macro values
                 for val in p.get("value", []):
                     for mv in val.get("mapVal", []):
                         key = mv.get("key")
@@ -51,31 +66,23 @@ def aggregate_googlefit_macros(raw: dict, tz_name: str = "Europe/Berlin"):
                         value = float(raw_value)
 
                         if key in ("calories", "nutrition.calories"):
-                            calories += value
+                            per_day[day]["calories_kcal"] += value
                         elif key in ("protein", "nutrition.protein"):
-                            protein += value
+                            per_day[day]["protein_g"] += value
                         elif key in ("carbs.total", "nutrition.carbs.total"):
-                            carbs += value
+                            per_day[day]["carbs_g"] += value
                         elif key in ("fat.total", "nutrition.fat.total"):
-                            fat += value
+                            per_day[day]["fat_g"] += value
 
-        if any(x > 0 for x in (calories, protein, carbs, fat)):
-            rows.append(
-                {
-                    "date": day,
-                    "calories_kcal": calories,
-                    "protein_g": protein,
-                    "carbs_g": carbs,
-                    "fat_g": fat,
-                }
-            )
-
-    if not rows:
+    if not per_day:
         return pd.DataFrame(columns=["date", "calories_kcal", "protein_g", "carbs_g", "fat_g"])
+
+    rows = []
+    for day, totals in per_day.items():
+        rows.append({"date": day, **totals})
 
     df = pd.DataFrame(rows).sort_values("date").reset_index(drop=True)
     return df
-
 
 # ---------------- Hevy Connect ----------------
 
