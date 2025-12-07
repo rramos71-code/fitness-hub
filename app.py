@@ -5,10 +5,12 @@ from clients.hevy_client import HevyClient
 from clients.garmin_client import GarminClient
 from clients.googlefit_client import GoogleFitClient
 
-st.title("Fitness Hub — Core Integrations Test")
+from utils.daily_aggregation import build_daily_dataset
 
 from zoneinfo import ZoneInfo
 from datetime import datetime, timezone
+
+st.title("Fitness Hub — Core Integrations Test")
 
 def aggregate_googlefit_macros(raw: dict, tz_name: str = "Europe/Berlin"):
     """
@@ -87,7 +89,11 @@ def aggregate_googlefit_macros(raw: dict, tz_name: str = "Europe/Berlin"):
 # ---------------- Hevy Connect ----------------
 
 st.header("Hevy Connection")
-if st.button("Test Hevy"):
+# After Hevy sync
+if st.button("Sync Hevy workouts"):
+    workouts_df, sets_df = hevy_client.sync_workouts()
+    st.session_state["hevy_sets_df"] = sets_df
+    st.dataframe(sets_df.head())
     try:
         client = HevyClient()
         workouts = client.get_workouts()
@@ -100,15 +106,15 @@ if st.button("Test Hevy"):
 # ---------------- Garmin Connect ----------------
 
 st.header("Garmin Connection")
+# After Garmin sync
 if st.button("Test Garmin"):
-    try:
-        client = GarminClient()
-        data = client.get_daily_summary(date.today())
-        st.success("Garmin connection OK")
-        st.json(data)
-    except Exception as e:
-        st.error(str(e))
-
+    daily_df, activities_df = garmin_client.fetch_daily_and_activities()
+    st.session_state["garmin_daily_df"] = daily_df
+    st.session_state["garmin_activities_df"] = activities_df
+    st.write("Daily")
+    st.dataframe(daily_df.head())
+    st.write("Activities")
+    st.dataframe(activities_df.head())
 # ---------------- Google Fit ----------------
 
 from clients.googlefit_client import GoogleFitClient
@@ -118,21 +124,11 @@ st.header("Google Fit Connection")
 # inside your Streamlit layout
 days_back = st.number_input("Days back", min_value=1, max_value=30, value=7, step=1)
 
+# After Google Fit sync
 if st.button("Test Google Fit nutrition"):
-    try:
-        client = GoogleFitClient()
-        # use the same aggregate call as the debug button
-        raw = client.debug_aggregate_raw(days_back=days_back)
-        df = aggregate_googlefit_macros(raw)
-
-        if df.empty:
-            st.info("Google Fit returned no nutrition entries for the selected period.")
-        else:
-            st.success("Google Fit connection OK - daily calories and macros aggregated")
-            st.dataframe(df)
-    except Exception as e:
-        st.error(f"Error reading Google Fit nutrition: {e}")
-
+    df = gf_client.aggregate_daily_macros(days_back=st.session_state.get("gf_days_back", 7))
+    st.session_state["googlefit_nutrition_df"] = df
+    st.dataframe(df)
 
 # Debug button
 if st.button("Debug raw Google Fit aggregate response"):
@@ -140,4 +136,42 @@ if st.button("Debug raw Google Fit aggregate response"):
     raw = client.debug_aggregate_raw(days_back=days_back)
     st.json(raw)
 
+# ... inside main() after other tabs
 
+daily_tab = st.sidebar.checkbox("Show daily dataset", value=True)  # or use st.tabs if you prefer
+
+if daily_tab:
+    st.subheader("Daily overview")
+
+    nutrition_df = st.session_state.get("googlefit_nutrition_df")
+    garmin_daily_df = st.session_state.get("garmin_daily_df")
+    garmin_activities_df = st.session_state.get("garmin_activities_df")
+    hevy_sets_df = st.session_state.get("hevy_sets_df")
+
+    if (
+        (nutrition_df is None or nutrition_df.empty)
+        and (garmin_daily_df is None or garmin_daily_df.empty)
+        and (garmin_activities_df is None or garmin_activities_df.empty)
+        and (hevy_sets_df is None or hevy_sets_df.empty)
+    ):
+        st.info("Load data from at least one source (Google Fit, Garmin, Hevy) to see the unified daily dataset.")
+    else:
+        daily_df = build_daily_dataset(
+            nutrition_df=nutrition_df,
+            garmin_daily_df=garmin_daily_df,
+            garmin_activities_df=garmin_activities_df,
+            hevy_sets_df=hevy_sets_df,
+        )
+        st.dataframe(daily_df)
+
+        # Quick sanity checks
+        st.caption("Rows per source:")
+        st.write(
+            {
+                "nutrition_rows": 0 if nutrition_df is None else len(nutrition_df),
+                "garmin_daily_rows": 0 if garmin_daily_df is None else len(garmin_daily_df),
+                "garmin_activities_rows": 0 if garmin_activities_df is None else len(garmin_activities_df),
+                "hevy_sets_rows": 0 if hevy_sets_df is None else len(hevy_sets_df),
+                "daily_rows": len(daily_df),
+            }
+        )
