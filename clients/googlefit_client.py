@@ -1,6 +1,7 @@
 import json
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+from typing import Dict, Any
 
 import pandas as pd
 import streamlit as st
@@ -12,7 +13,17 @@ SCOPES = ["https://www.googleapis.com/auth/fitness.nutrition.read"]
 
 
 class GoogleFitClient:
-    def __init__(self):
+    """
+    Wrapper around Google Fit REST API for nutrition.
+
+    - Uses a pre-authorised token JSON from Streamlit secrets.
+    - Exposes:
+        * get_daily_macros(days_back)
+        * aggregate_daily_macros(days_back)  # thin alias used by app.py
+        * debug_aggregate_raw(days_back)
+    """
+
+    def __init__(self) -> None:
         token_json = st.secrets.get("GOOGLE_FIT_TOKEN_JSON")
         client_id = st.secrets.get("GOOGLE_FIT_CLIENT_ID")
         client_secret = st.secrets.get("GOOGLE_FIT_CLIENT_SECRET")
@@ -32,22 +43,16 @@ class GoogleFitClient:
             if creds.expired and creds.refresh_token:
                 creds.refresh(Request())
             else:
-                raise RuntimeError("Stored Google Fit credentials are invalid and cannot be refreshed.")
+                raise RuntimeError(
+                    "Stored Google Fit credentials are invalid and cannot be refreshed."
+                )
 
         self.service = build("fitness", "v1", credentials=creds)
 
-    def get_daily_macros(self, days_back: int = 14) -> pd.DataFrame:
-        """
-        Aggregate daily calories and macros via Google Fit aggregate API.
-
-        - Uses com.google.nutrition as base type
-        - Buckets by 1 day in Europe/Berlin
-        - Sums all points in each bucket
-        - Only counts entries coming from Lose It (originDataSourceId contains 'com.fitnow.loseit')
-        """
+    # ------------------------------------------------------------------
+    def _aggregate_request(self, days_back: int) -> Dict[str, Any]:
         tz = ZoneInfo("Europe/Berlin")
 
-        # Use local time boundaries so buckets align with what you see in the app
         end_local = datetime.now(tz)
         start_local = end_local - timedelta(days=days_back)
 
@@ -55,9 +60,7 @@ class GoogleFitClient:
         start_ms = int(start_local.timestamp() * 1000)
 
         body = {
-            "aggregateBy": [
-                {"dataTypeName": "com.google.nutrition"}
-            ],
+            "aggregateBy": [{"dataTypeName": "com.google.nutrition"}],
             "bucketByTime": {
                 "durationMillis": 24 * 60 * 60 * 1000,
                 "timeZoneId": "Europe/Berlin",
@@ -72,17 +75,24 @@ class GoogleFitClient:
             .aggregate(userId="me", body=body)
             .execute()
         )
+        return response
 
+    # ------------------------------------------------------------------
+    # Main logic: convert aggregate response into daily macros
+    # ------------------------------------------------------------------
+    def get_daily_macros(self, days_back: int = 14) -> pd.DataFrame:
+        tz = ZoneInfo("Europe/Berlin")
+        response = self._aggregate_request(days_back)
         buckets = response.get("bucket", [])
+
         rows = []
 
         for b in buckets:
-            start_time_ms = int(b.get("startTimeMillis", "0") or "0")
-            if start_time_ms == 0:
+            start_ms = int(b.get("startTimeMillis", "0") or "0")
+            if start_ms == 0:
                 continue
 
-            # convert bucket start to local calendar date
-            day_dt = datetime.fromtimestamp(start_time_ms / 1000.0, tz=tz)
+            day_dt = datetime.fromtimestamp(start_ms / 1000.0, tz=tz)
             day = day_dt.date()
 
             calories = protein = carbs = fat = 0.0
@@ -91,9 +101,8 @@ class GoogleFitClient:
                 for p in ds.get("point", []):
                     origin = p.get("originDataSourceId", "")
 
-                    # keep only Lose It entries
-                    if "com.fitnow.loseit" not in origin:
-                        continue
+                    # We no longer filter to LoseIt only: any app that writes
+                    # com.google.nutrition.summary is accepted (Cronometer, Lose It, manual input,…)
 
                     for val in p.get("value", []):
                         for mv in val.get("mapVal", []):
@@ -113,7 +122,6 @@ class GoogleFitClient:
                             elif key in ("fat.total", "nutrition.fat.total"):
                                 fat += value
 
-            # only add rows that actually have some macro data
             if any(x > 0 for x in (calories, protein, carbs, fat)):
                 rows.append(
                     {
@@ -133,31 +141,20 @@ class GoogleFitClient:
         df = pd.DataFrame(rows).sort_values("date").reset_index(drop=True)
         return df
 
-    def debug_aggregate_raw(self, days_back: int = 7) -> dict:
-        """Return raw aggregate response for debugging in the Streamlit app."""
-        tz = ZoneInfo("Europe/Berlin")
-        end_local = datetime.now(tz)
-        start_local = end_local - timedelta(days=days_back)
+    # ------------------------------------------------------------------
+    # Alias used by app.py
+    # ------------------------------------------------------------------
+    def aggregate_daily_macros(self, days_back: int = 14) -> pd.DataFrame:
+        """
+        Thin wrapper used by the Streamlit UI.
+        """
+        return self.get_daily_macros(days_back=days_back)
 
-        end_ms = int(end_local.timestamp() * 1000)
-        start_ms = int(start_local.timestamp() * 1000)
-
-        body = {
-            "aggregateBy": [
-                {"dataTypeName": "com.google.nutrition"}
-            ],
-            "bucketByTime": {
-                "durationMillis": 24 * 60 * 60 * 1000,
-                "timeZoneId": "Europe/Berlin",
-            },
-            "startTimeMillis": start_ms,
-            "endTimeMillis": end_ms,
-        }
-
-        response = (
-            self.service.users()
-            .dataset()
-            .aggregate(userId="me", body=body)
-            .execute()
-        )
-        return response
+    # ------------------------------------------------------------------
+    # Debug helper
+    # ------------------------------------------------------------------
+    def debug_aggregate_raw(self, days_back: int = 7) -> Dict[str, Any]:
+        """
+        Return raw aggregate response for debugging.
+        """
+        return self._aggregate_request(days_back)
