@@ -5,7 +5,7 @@ from clients.hevy_client import HevyClient
 from clients.garmin_client import GarminClient
 from clients.googlefit_client import GoogleFitClient
 
-from google_fit_client import GoogleFitClient
+from googlefit_client import GoogleFitClient
 
 st.title("Fitness Hub — Core Integrations Test")
 
