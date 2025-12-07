@@ -10,6 +10,20 @@ from utils.daily_aggregation import build_daily_dataset
 from zoneinfo import ZoneInfo
 from datetime import datetime, timezone
 
+# ---- API clients ----
+if "hevy_client" not in st.session_state:
+    st.session_state["hevy_client"] = HevyClient()
+
+if "garmin_client" not in st.session_state:
+    st.session_state["garmin_client"] = GarminClient()
+
+if "gf_client" not in st.session_state:
+    st.session_state["gf_client"] = GoogleFitClient()
+
+hevy_client = st.session_state["hevy_client"]
+garmin_client = st.session_state["garmin_client"]
+gf_client = st.session_state["gf_client"]
+
 st.title("Fitness Hub — Core Integrations Test")
 
 def aggregate_googlefit_macros(raw: dict, tz_name: str = "Europe/Berlin"):
