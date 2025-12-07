@@ -202,12 +202,53 @@ if st.button("Debug raw Google Fit aggregate response"):
 
 # -------------------- Unified daily view -----------------
 
+def _ensure_date_column(df, candidates):
+    """
+    Make sure the dataframe has a 'date' column.
+
+    - If 'date' already exists, leave it.
+    - Otherwise, try each candidate column name, convert to datetime,
+      and take the .date() part.
+    - If nothing works, return an empty DataFrame to avoid KeyError
+      in the daily aggregation.
+    """
+    if df is None or getattr(df, "empty", True):
+        return df
+
+    if "date" in df.columns:
+        # normalise to date only, just in case it’s datetime
+        df = df.copy()
+        df["date"] = pd.to_datetime(df["date"]).dt.date
+        return df
+
+    for col in candidates:
+        if col in df.columns:
+            df = df.copy()
+            df["date"] = pd.to_datetime(df[col]).dt.date
+            return df
+
+    # No usable date column found; better to drop this df than to crash
+    return pd.DataFrame()
+
+# =================== Unified daily view ==================
 st.subheader("Daily overview (unified dataset)")
 
 nutrition_df = st.session_state.get("googlefit_nutrition_df")
 garmin_daily_df = st.session_state.get("garmin_daily_df")
 garmin_activities_df = st.session_state.get("garmin_activities_df")
 hevy_sets_df = st.session_state.get("hevy_sets_df")
+
+# Standardise 'date' column for all sources
+nutrition_df = _ensure_date_column(nutrition_df, ["date"])
+garmin_daily_df = _ensure_date_column(garmin_daily_df, ["calendarDate"])
+garmin_activities_df = _ensure_date_column(
+    garmin_activities_df,
+    ["startTimeLocal", "startTimeGMT", "start_time"],
+)
+hevy_sets_df = _ensure_date_column(
+    hevy_sets_df,
+    ["performed_at", "start_time"],
+)
 
 if (
     (nutrition_df is None or nutrition_df.empty)
