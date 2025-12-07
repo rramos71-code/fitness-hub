@@ -88,6 +88,11 @@ class GoogleFitClient:
 
             for ds in b.get("dataset", []):
                 for p in ds.get("point", []):
+                    # Only keep nutrition logged via Lose It
+                    origin = p.get("originDataSourceId", "")
+                    if "com.fitnow.loseit" not in origin:
+                        continue
+
                     for val in p.get("value", []):
                         for mv in val.get("mapVal", []):
                             key = mv.get("key")
@@ -97,7 +102,6 @@ class GoogleFitClient:
                                 continue
                             value = float(raw)
 
-                            # Your observed keys (plus optional nutrition.* variants)
                             if key in ("calories", "nutrition.calories"):
                                 calories += value
                             elif key in ("protein", "nutrition.protein"):
@@ -107,18 +111,6 @@ class GoogleFitClient:
                             elif key in ("fat.total", "nutrition.fat.total"):
                                 fat += value
 
-            # Keep only days that actually have some macro data
-            if any(x > 0 for x in (calories, protein, carbs, fat)):
-                rows.append(
-                    {
-                        "date": day,
-                        "calories_kcal": calories,
-                        "protein_g": protein,
-                        "carbs_g": carbs,
-                        "fat_g": fat,
-                    }
-                )
-
         if not rows:
             return pd.DataFrame(
                 columns=["date", "calories_kcal", "protein_g", "carbs_g", "fat_g"]
@@ -126,3 +118,32 @@ class GoogleFitClient:
 
         df = pd.DataFrame(rows).sort_values("date").reset_index(drop=True)
         return df
+
+    def debug_aggregate_raw(self, days_back: int = 7) -> dict:
+        """Return raw aggregate response for debugging in the Streamlit app."""
+        tz = ZoneInfo("Europe/Berlin")
+        end_local = datetime.now(tz)
+        start_local = end_local - timedelta(days=days_back)
+
+        end_ms = int(end_local.timestamp() * 1000)
+        start_ms = int(start_local.timestamp() * 1000)
+
+        body = {
+            "aggregateBy": [
+                {"dataTypeName": "com.google.nutrition"}
+            ],
+            "bucketByTime": {
+                "durationMillis": 24 * 60 * 60 * 1000,
+                "timeZoneId": "Europe/Berlin",
+            },
+            "startTimeMillis": start_ms,
+            "endTimeMillis": end_ms,
+        }
+
+        response = (
+            self.service.users()
+            .dataset()
+            .aggregate(userId="me", body=body)
+            .execute()
+        )
+        return response
