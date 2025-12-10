@@ -1,5 +1,5 @@
 import streamlit as st
-from datetime import date, datetime, timezone
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -8,11 +8,9 @@ import pandas as pd
 from clients.hevy_client import HevyClient
 from clients.garmin_client import GarminClient
 from clients.googlefit_client import GoogleFitClient
-from utils.daily_aggregation import build_daily_dataset
 
 # =========================================================
 #  Column mapping from unified daily_df
-#  >>> ADAPT THESE NAMES ONCE TO MATCH YOUR build_daily_dataset <<<
 # =========================================================
 COLS = {
     # nutrition (from Google Fit)
@@ -22,7 +20,7 @@ COLS = {
     "fat_g": "fat_g",
 
     # activity / energy out (from Garmin)
-    "calories_out": "garmin_calories_kcal",   # adjust to your actual column
+    "calories_out": "garmin_calories_kcal",
     "steps": "garmin_steps",
     "sleep_hours": "garmin_sleep_hours",
 
@@ -32,7 +30,7 @@ COLS = {
 }
 
 # =========================================================
-# Helpers
+# Helper utilities
 # =========================================================
 def ensure_date_column(df: pd.DataFrame | None) -> pd.DataFrame | None:
     """
@@ -43,10 +41,12 @@ def ensure_date_column(df: pd.DataFrame | None) -> pd.DataFrame | None:
         return df
 
     if "date" in df.columns:
+        df = df.copy()
+        df["date"] = pd.to_datetime(df["date"]).dt.date
         return df
 
     df = df.copy()
-    for cand in ["calendarDate", "calendar_date", "day", "Day", "DATE"]:
+    for cand in ["calendarDate", "calendar_date", "day", "Day", "DATE", "startTime"]:
         if cand in df.columns:
             df["date"] = pd.to_datetime(df[cand]).dt.date
             return df
@@ -56,6 +56,130 @@ def ensure_date_column(df: pd.DataFrame | None) -> pd.DataFrame | None:
         df["date"] = df.index.date
 
     return df
+
+
+def _first_existing(df: pd.DataFrame, candidates) -> str | None:
+    for c in candidates:
+        if c in df.columns:
+            return c
+    return None
+
+
+def build_daily_dataset(
+    nutrition_df: pd.DataFrame | None,
+    garmin_daily_df: pd.DataFrame | None,
+    garmin_activities_df: pd.DataFrame | None,  # currently unused but kept for future
+    hevy_sets_df: pd.DataFrame | None,
+) -> pd.DataFrame:
+    """
+    Small, defensive unifier that creates a per-day DataFrame across
+    Google Fit nutrition, Garmin daily stats, and Hevy sets.
+    """
+
+    frames = []
+
+    # ---------- Google Fit: nutrition ----------
+    if nutrition_df is not None and not nutrition_df.empty:
+        n = ensure_date_column(nutrition_df)
+        if n is not None and not n.empty and "date" in n.columns:
+            n = n.copy()
+            n["date"] = pd.to_datetime(n["date"]).dt.date
+
+            # These are the columns produced by GoogleFitClient.aggregate_daily_macros
+            agg_cols = {
+                "calories_kcal": "sum",
+                "protein_g": "sum",
+                "carbs_g": "sum",
+                "fat_g": "sum",
+            }
+            existing = {k: v for k, v in agg_cols.items() if k in n.columns}
+            n = n.groupby("date", as_index=False).agg(existing)
+
+            # names already aligned with COLS mapping
+            frames.append(n)
+
+    # ---------- Garmin: daily summary ----------
+    if garmin_daily_df is not None and not garmin_daily_df.empty:
+        g = ensure_date_column(garmin_daily_df)
+        if g is not None and not g.empty and "date" in g.columns:
+            g = g.copy()
+            g["date"] = pd.to_datetime(g["date"]).dt.date
+
+            # Try to infer calories / steps / sleep columns from typical Garmin exports
+            cal_col = _first_existing(
+                g, ["caloriesTotal", "calories_total", "activeKilocalories", "calories"]
+            )
+            steps_col = _first_existing(
+                g, ["steps", "stepCount", "totalSteps"]
+            )
+            sleep_sec_col = _first_existing(
+                g, ["sleepingSeconds", "sleepDurationInSeconds", "sleepSeconds"]
+            )
+
+            if sleep_sec_col:
+                g["sleep_hours_tmp"] = g[sleep_sec_col] / 3600.0
+
+            agg_spec = {}
+            if cal_col:
+                agg_spec[cal_col] = "sum"
+            if steps_col:
+                agg_spec[steps_col] = "sum"
+            if "sleep_hours_tmp" in g.columns:
+                agg_spec["sleep_hours_tmp"] = "sum"
+
+            if agg_spec:
+                g_day = g.groupby("date", as_index=False).agg(agg_spec)
+
+                if cal_col:
+                    g_day.rename(
+                        columns={cal_col: "garmin_calories_kcal"}, inplace=True
+                    )
+                if steps_col:
+                    g_day.rename(columns={steps_col: "garmin_steps"}, inplace=True)
+                if "sleep_hours_tmp" in g_day.columns:
+                    g_day.rename(
+                        columns={"sleep_hours_tmp": "garmin_sleep_hours"}, inplace=True
+                    )
+
+                frames.append(g_day)
+
+    # ---------- Hevy: sets ----------
+    if hevy_sets_df is not None and not hevy_sets_df.empty:
+        h = ensure_date_column(hevy_sets_df)
+        if h is not None and not h.empty and "date" in h.columns:
+            h = h.copy()
+            h["date"] = pd.to_datetime(h["date"]).dt.date
+
+            weight_col = _first_existing(h, ["weight_kg", "weight"])
+            reps_col = _first_existing(h, ["reps", "repetitions"])
+
+            if weight_col and reps_col:
+                h["volume_tmp"] = h[weight_col].fillna(0) * h[reps_col].fillna(0)
+            else:
+                h["volume_tmp"] = 0.0
+
+            h_day = (
+                h.groupby("date")
+                .agg(
+                    hevy_sets=("id", "count") if "id" in h.columns else ("volume_tmp", "size"),
+                    hevy_volume_kg=("volume_tmp", "sum"),
+                )
+                .reset_index()
+            )
+
+            frames.append(h_day)
+
+    if not frames:
+        return pd.DataFrame(columns=["date"])
+
+    from functools import reduce
+
+    daily = reduce(
+        lambda left, right: pd.merge(left, right, on="date", how="outer"), frames
+    )
+
+    daily = daily.sort_values("date").reset_index(drop=True)
+    return daily
 
 
 def _ensure_date_and_week(df: pd.DataFrame) -> pd.DataFrame:
@@ -119,11 +243,11 @@ def build_macro_adherence(
         df["protein_delta"] = df[prot_col] - target_protein
         df["protein_met"] = df[prot_col] >= target_protein
 
-    cols = ["date", cin_col, prot_col]
-    if "calories_delta" in df.columns:
-        cols += ["calories_delta", "calories_within_5pct"]
-    if "protein_delta" in df.columns:
-        cols += ["protein_delta", "protein_met"]
+    cols = ["date"]
+    if cin_col in df.columns:
+        cols += [cin_col, "calories_delta", "calories_within_5pct"]
+    if prot_col in df.columns:
+        cols += [prot_col, "protein_delta", "protein_met"]
 
     return df[cols].copy()
 
@@ -244,17 +368,11 @@ garmin_daily_df = st.session_state.get("garmin_daily_df")
 garmin_activities_df = st.session_state.get("garmin_activities_df")
 hevy_sets_df = st.session_state.get("hevy_sets_df")
 
-# normalize date columns so build_daily_dataset never explodes on 'date'
-nutrition_df = ensure_date_column(nutrition_df)
-garmin_daily_df = ensure_date_column(garmin_daily_df)
-garmin_activities_df = ensure_date_column(garmin_activities_df)
-hevy_sets_df = ensure_date_column(hevy_sets_df)
-
 if (
-    (nutrition_df is None or nutrition_df.empty)
-    and (garmin_daily_df is None or garmin_daily_df.empty)
-    and (garmin_activities_df is None or garmin_activities_df.empty)
-    and (hevy_sets_df is None or hevy_sets_df.empty)
+    (nutrition_df is None or (hasattr(nutrition_df, "empty") and nutrition_df.empty))
+    and (garmin_daily_df is None or (hasattr(garmin_daily_df, "empty") and garmin_daily_df.empty))
+    and (garmin_activities_df is None or (hasattr(garmin_activities_df, "empty") and garmin_activities_df.empty))
+    and (hevy_sets_df is None or (hasattr(hevy_sets_df, "empty") and hevy_sets_df.empty))
 ):
     st.info(
         "Load data from at least one source (Google Fit, Garmin, Hevy) "
@@ -352,22 +470,34 @@ else:
         st.dataframe(macro_adherence)
 
         adherence_summary = {
-            "days_in_range_calories_±5%": int(macro_adherence["calories_within_5pct"].sum()),
+            "days_in_range_calories_±5%": int(
+                macro_adherence["calories_within_5pct"].sum()
+            )
+            if "calories_within_5pct" in macro_adherence.columns
+            else 0,
             "total_days_with_calories": int(
                 macro_adherence["calories_within_5pct"].notna().sum()
-            ),
-            "days_meeting_protein": int(macro_adherence["protein_met"].sum()),
+            )
+            if "calories_within_5pct" in macro_adherence.columns
+            else 0,
+            "days_meeting_protein": int(macro_adherence["protein_met"].sum())
+            if "protein_met" in macro_adherence.columns
+            else 0,
             "total_days_with_protein": int(
                 macro_adherence["protein_met"].notna().sum()
-            ),
+            )
+            if "protein_met" in macro_adherence.columns
+            else 0,
         }
         st.caption("Adherence summary")
         st.write(adherence_summary)
 
         cin_col = COLS["calories_in"]
         prot_col = COLS["protein_g"]
-        chart_df = macro_adherence.set_index("date")[[cin_col, prot_col]]
-        st.line_chart(chart_df)
+        plot_cols = [c for c in [cin_col, prot_col] if c in macro_adherence.columns]
+        if plot_cols:
+            chart_df = macro_adherence.set_index("date")[plot_cols]
+            st.line_chart(chart_df)
 
     # ---- 3. Weekly training load & frequency ----
     st.subheader("3. Weekly training load & frequency")
