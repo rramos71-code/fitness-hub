@@ -1,27 +1,40 @@
-from datetime import date, timedelta
+from __future__ import annotations
+
+import json
 import os
-from typing import Tuple, List, Dict, Any
+from dataclasses import dataclass
+from datetime import date, timedelta
 
 import pandas as pd
 import streamlit as st
-from garminconnect import Garmin
+from garminconnect import Garmin, GarminConnectAuthenticationError
+
+
+@dataclass
+class GarminCredentials:
+    email: str
+    password: str
 
 
 class GarminClient:
     """
-    Wrapper for garminconnect.Garmin.
+    Thin wrapper around garminconnect.Garmin that:
 
-    - Reads GARMIN_EMAIL / GARMIN_PASSWORD from secrets or env.
-    - Exposes:
-        * get_daily_summary(day)                -> raw stats dict
-        * fetch_daily_and_activities(days_back) -> (daily_df, activities_df)
+    - Reads credentials from Streamlit secrets or env variables
+    - Provides a helper to fetch daily summaries + activities
+    - Parses calories / steps / distance out of the raw stats dict
     """
 
-    def __init__(self) -> None:
+    def __init__(self):
+        self.creds = self._load_credentials()
+
+    # ---------- internal helpers ----------
+
+    def _load_credentials(self) -> GarminCredentials:
         email = None
         password = None
 
-        # 1. Try top level secrets
+        # 1) top-level secrets
         try:
             if "GARMIN_EMAIL" in st.secrets:
                 email = st.secrets["GARMIN_EMAIL"]
@@ -30,7 +43,7 @@ class GarminClient:
         except Exception:
             pass
 
-        # 2. Try nested section [fitness_hub]
+        # 2) nested section [fitness_hub]
         if not email or not password:
             try:
                 fh = st.secrets.get("fitness_hub", {})
@@ -39,119 +52,104 @@ class GarminClient:
             except Exception:
                 pass
 
-        # 3. Env vars
+        # 3) env variables
         email = email or os.getenv("GARMIN_EMAIL")
         password = password or os.getenv("GARMIN_PASSWORD")
 
         if not email or not password:
             raise RuntimeError(
-                "Garmin credentials not found. Set GARMIN_EMAIL and GARMIN_PASSWORD "
-                "in Streamlit secrets or environment variables."
+                "Garmin credentials not found. "
+                "Set GARMIN_EMAIL and GARMIN_PASSWORD in Streamlit secrets or env."
             )
 
-        self.email = email
-        self.password = password
+        return GarminCredentials(email=email, password=password)
 
-    # ------------------------------------------------------------------
     def _login(self) -> Garmin:
-        client = Garmin(self.email, self.password)
+        client = Garmin(self.creds.email, self.creds.password)
         client.login()
         return client
 
-    # ------------------------------------------------------------------
-    # Existing convenience methods
-    # ------------------------------------------------------------------
-    def get_today_summary(self):
-        return self.get_daily_summary(date.today())
+    # ---------- public methods ----------
 
-    def get_daily_summary(self, day: date) -> Dict[str, Any]:
+    def get_daily_summary(self, day: date) -> dict:
+        """One-off helper if you ever want a single day."""
         client = self._login()
         try:
-            day_str = day.isoformat()
-            stats = client.get_stats(day_str)
+            return client.get_stats(day.isoformat()) or {}
         finally:
             try:
                 client.logout()
             except Exception:
                 pass
-        return stats
 
-    # ------------------------------------------------------------------
-    # New method expected by app.py
-    # ------------------------------------------------------------------
-    def fetch_daily_and_activities(
-        self, days_back: int = 14
-    ) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    def fetch_daily_and_activities(self, days_back: int = 14) -> tuple[pd.DataFrame, pd.DataFrame]:
         """
-        Fetch a simple daily summary and activities list for the last `days_back` days.
+        Main entry point used by the app.
 
         Returns:
-            daily_df      : one row per day (date, steps, calories & distance if available)
-            activities_df : one row per activity from Garmin's get_activities()
-
-        The schema is intentionally simple and robust; you can always extend
-        it later once you know exactly which fields you want for analytics.
+            daily_df:    columns = [date, steps, calories, distance_km, raw_stats]
+            activities_df: one row per recorded activity
         """
         client = self._login()
         try:
-            # --- daily summaries ---
             today = date.today()
             start = today - timedelta(days=days_back - 1)
 
-            daily_rows: List[Dict[str, Any]] = []
-
+            # -------- daily summaries --------
+            daily_rows = []
             for i in range(days_back):
-                day = start + timedelta(days=i)
-                stats = client.get_stats(day.isoformat()) or {}
+                d = start + timedelta(days=i)
+                d_str = d.isoformat()
 
-                # stats shape can vary; we try to be defensive
-                steps = None
-                calories = None
-                distance_km = None
+                stats = client.get_stats(d_str) or {}
+                raw_stats = json.dumps(stats)  # keep full blob for debugging
 
-                # Common locations for the values in Garmin's JSON
-                try:
-                    steps = stats.get("steps", {}).get("total", None)
-                except Exception:
-                    pass
+                # Garmin’s keys can vary a bit between accounts, so we check a few options
+                def _get_number(keys, default=None):
+                    for k in keys:
+                        if k in stats and stats[k] not in (None, "", "null"):
+                            try:
+                                return float(stats[k])
+                            except Exception:
+                                pass
+                    return default
 
-                try:
-                    calories = stats.get("calories", {}).get("total", None)
-                except Exception:
-                    pass
-
-                try:
-                    distance_km = stats.get("distance", {}).get("total", None)
-                except Exception:
-                    pass
+                calories = _get_number(["totalKilocalories", "activeKilocalories"])
+                steps = _get_number(["steps", "totalSteps", "stepCount"])
+                # distance often comes in meters
+                distance_m = _get_number(["distance", "totalDistanceMeters"])
+                distance_km = None if distance_m is None else distance_m / 1000.0
 
                 daily_rows.append(
                     {
-                        "date": day,
-                        "steps": steps,
+                        "date": d,
+                        "steps": None if steps is None else int(steps),
                         "calories": calories,
                         "distance_km": distance_km,
-                        "raw_stats": stats,
+                        "raw_stats": raw_stats,
                     }
                 )
 
-            daily_df = (
-                pd.DataFrame(daily_rows)
-                if daily_rows
-                else pd.DataFrame(columns=["date", "steps", "calories", "distance_km", "raw_stats"])
-            )
+            daily_df = pd.DataFrame(daily_rows)
 
-            # --- activities list ---
-            # Garmin API: get_activities(start, limit)
-            # We'll just grab recent activities; limit is a bit arbitrary.
-            try:
-                activities = client.get_activities(0, 100) or []
-            except Exception:
-                activities = []
-
-            activities_df = (
-                pd.DataFrame(activities) if activities else pd.DataFrame()
-            )
+            # -------- activities --------
+            # grab recent activities (0..99 is plenty for our use case)
+            activities = client.get_activities(0, 100) or []
+            act_rows = []
+            for a in activities:
+                act_rows.append(
+                    {
+                        "activityId": a.get("activityId"),
+                        "activityName": a.get("activityName"),
+                        "startTimeLocal": a.get("startTimeLocal"),
+                        "startTimeGMT": a.get("startTimeGMT"),
+                        "activityType": (a.get("activityType") or {}).get("typeKey"),
+                        "distance": a.get("distance"),
+                        "duration": a.get("duration"),
+                        "calories": a.get("calories"),
+                    }
+                )
+            activities_df = pd.DataFrame(act_rows)
 
         finally:
             try:
