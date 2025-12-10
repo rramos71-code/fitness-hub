@@ -22,82 +22,45 @@ COLS = {
     "fat_g": "fat_g",
 
     # activity / energy out (from Garmin)
-    # adjust these to whatever your daily aggregation uses
-    "calories_out": "garmin_calories_kcal",      # e.g. active + resting, or active only
+    "calories_out": "garmin_calories_kcal",   # adjust to your actual column
     "steps": "garmin_steps",
     "sleep_hours": "garmin_sleep_hours",
 
     # resistance training (from Hevy aggregated per day)
-    "hevy_sets": "hevy_sets",                    # total sets per day
-    "hevy_volume": "hevy_volume_kg",             # total tonnage per day
+    "hevy_sets": "hevy_sets",
+    "hevy_volume": "hevy_volume_kg",
 }
 
 # =========================================================
-# Helper: Google Fit raw -> daily macros
-# (kept here in case we want to debug raw responses later)
+# Helpers
 # =========================================================
-def aggregate_googlefit_macros(raw: dict, tz_name: str = "Europe/Berlin"):
-    tz = ZoneInfo(tz_name)
-    per_day = {}
+def ensure_date_column(df: pd.DataFrame | None) -> pd.DataFrame | None:
+    """
+    Guarantee a 'date' column exists if the DF is not empty.
+    Tries common alternatives like 'calendarDate' or 'day'.
+    """
+    if df is None or df.empty:
+        return df
 
-    for b in raw.get("bucket", []):
-        for ds in b.get("dataset", []):
-            for p in ds.get("point", []):
-                end_ns = int(p.get("endTimeNanos", "0") or "0")
-                if end_ns == 0:
-                    start_ms = int(b.get("startTimeMillis", "0") or "0")
-                    if start_ms == 0:
-                        continue
-                    dt_local = datetime.fromtimestamp(start_ms / 1000.0, tz=tz)
-                else:
-                    dt_utc = datetime.fromtimestamp(end_ns / 1e9, tz=timezone.utc)
-                    dt_local = dt_utc.astimezone(tz)
+    if "date" in df.columns:
+        return df
 
-                day = dt_local.date()
+    df = df.copy()
+    for cand in ["calendarDate", "calendar_date", "day", "Day", "DATE"]:
+        if cand in df.columns:
+            df["date"] = pd.to_datetime(df[cand]).dt.date
+            return df
 
-                if day not in per_day:
-                    per_day[day] = {
-                        "calories_kcal": 0.0,
-                        "protein_g": 0.0,
-                        "carbs_g": 0.0,
-                        "fat_g": 0.0,
-                    }
+    # last resort: if index looks like dates
+    if isinstance(df.index, pd.DatetimeIndex):
+        df["date"] = df.index.date
 
-                for val in p.get("value", []):
-                    for mv in val.get("mapVal", []):
-                        key = mv.get("key")
-                        v = mv.get("value", {})
-                        raw_value = v.get("fpVal") if "fpVal" in v else v.get("intVal")
-                        if raw_value is None:
-                            continue
-                        value = float(raw_value)
-
-                        if key in ("calories", "nutrition.calories"):
-                            per_day[day]["calories_kcal"] += value
-                        elif key in ("protein", "nutrition.protein"):
-                            per_day[day]["protein_g"] += value
-                        elif key in ("carbs.total", "nutrition.carbs.total"):
-                            per_day[day]["carbs_g"] += value
-                        elif key in ("fat.total", "nutrition.fat.total"):
-                            per_day[day]["fat_g"] += value
-
-    if not per_day:
-        return pd.DataFrame(
-            columns=["date", "calories_kcal", "protein_g", "carbs_g", "fat_g"]
-        )
-
-    rows = [{"date": d, **totals} for d, totals in per_day.items()]
-    df = pd.DataFrame(rows).sort_values("date").reset_index(drop=True)
     return df
 
 
-# =========================================================
-# Tier-1 analytics helpers
-# =========================================================
 def _ensure_date_and_week(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     out["date"] = pd.to_datetime(out["date"])
-    # week_start = Monday of that week
     out["week_start"] = out["date"] - pd.to_timedelta(out["date"].dt.weekday, unit="D")
     return out
 
@@ -115,10 +78,7 @@ def build_weekly_energy_summary(daily_df: pd.DataFrame) -> pd.DataFrame:
     rows = []
 
     for week, g in group:
-        row = {
-            "week_start": week.date(),
-            "days_with_data": len(g),
-        }
+        row = {"week_start": week.date(), "days_with_data": len(g)}
 
         if cin_col in g.columns:
             row["calories_in_sum"] = g[cin_col].sum()
@@ -127,7 +87,7 @@ def build_weekly_energy_summary(daily_df: pd.DataFrame) -> pd.DataFrame:
             row["calories_out_sum"] = g[cout_col].sum()
             row["calories_out_avg"] = g[cout_col].mean()
 
-        if ("calories_in_sum" in row) and ("calories_out_sum" in row):
+        if "calories_in_sum" in row and "calories_out_sum" in row:
             row["energy_balance_sum"] = row["calories_in_sum"] - row["calories_out_sum"]
 
         rows.append(row)
@@ -135,9 +95,11 @@ def build_weekly_energy_summary(daily_df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows).sort_values("week_start").reset_index(drop=True)
 
 
-def build_macro_adherence(daily_df: pd.DataFrame,
-                          target_calories: float,
-                          target_protein: float) -> pd.DataFrame:
+def build_macro_adherence(
+    daily_df: pd.DataFrame,
+    target_calories: float,
+    target_protein: float,
+) -> pd.DataFrame:
     df = daily_df.copy()
     cin_col = COLS["calories_in"]
     prot_col = COLS["protein_g"]
@@ -149,17 +111,21 @@ def build_macro_adherence(daily_df: pd.DataFrame,
 
     if cin_col in df.columns:
         df["calories_delta"] = df[cin_col] - target_calories
-        df["calories_within_5pct"] = (
-            df[cin_col].between(0.95 * target_calories, 1.05 * target_calories)
+        df["calories_within_5pct"] = df[cin_col].between(
+            0.95 * target_calories, 1.05 * target_calories
         )
 
     if prot_col in df.columns:
         df["protein_delta"] = df[prot_col] - target_protein
         df["protein_met"] = df[prot_col] >= target_protein
 
-    return df[["date", cin_col, prot_col,
-               "calories_delta", "calories_within_5pct",
-               "protein_delta", "protein_met"]].copy()
+    cols = ["date", cin_col, prot_col]
+    if "calories_delta" in df.columns:
+        cols += ["calories_delta", "calories_within_5pct"]
+    if "protein_delta" in df.columns:
+        cols += ["protein_delta", "protein_met"]
+
+    return df[cols].copy()
 
 
 def build_training_load_summary(daily_df: pd.DataFrame) -> pd.DataFrame:
@@ -174,7 +140,6 @@ def build_training_load_summary(daily_df: pd.DataFrame) -> pd.DataFrame:
         steps_col not in df.columns):
         return pd.DataFrame()
 
-    # training day flag: Hevy sets OR high-steps day
     df["is_hevy_day"] = df[sets_col] > 0 if sets_col in df.columns else False
     if steps_col in df.columns:
         df["is_high_step_day"] = df[steps_col] >= 8000
@@ -279,6 +244,12 @@ garmin_daily_df = st.session_state.get("garmin_daily_df")
 garmin_activities_df = st.session_state.get("garmin_activities_df")
 hevy_sets_df = st.session_state.get("hevy_sets_df")
 
+# normalize date columns so build_daily_dataset never explodes on 'date'
+nutrition_df = ensure_date_column(nutrition_df)
+garmin_daily_df = ensure_date_column(garmin_daily_df)
+garmin_activities_df = ensure_date_column(garmin_activities_df)
+hevy_sets_df = ensure_date_column(hevy_sets_df)
+
 if (
     (nutrition_df is None or nutrition_df.empty)
     and (garmin_daily_df is None or garmin_daily_df.empty)
@@ -330,7 +301,7 @@ else:
     with st.expander("Debug: available daily_df columns", expanded=False):
         st.write(list(daily_df.columns))
 
-    # ---- Targets for adherence (can tune later / store in settings) ----
+    # ---- Targets for adherence ----
     st.subheader("Targets")
     col1, col2 = st.columns(2)
     with col1:
@@ -358,12 +329,10 @@ else:
         st.info("No calories_in / calories_out columns found for energy balance.")
     else:
         st.dataframe(weekly_energy)
-        # Simple charts if both in & out exist
         if {"calories_in_avg", "calories_out_avg"}.issubset(weekly_energy.columns):
-            chart_df = weekly_energy.set_index("week_start")[[
-                "calories_in_avg",
-                "calories_out_avg",
-            ]]
+            chart_df = weekly_energy.set_index("week_start")[
+                ["calories_in_avg", "calories_out_avg"]
+            ]
             st.line_chart(chart_df)
 
         if "energy_balance_sum" in weekly_energy.columns:
@@ -384,14 +353,17 @@ else:
 
         adherence_summary = {
             "days_in_range_calories_±5%": int(macro_adherence["calories_within_5pct"].sum()),
-            "total_days_with_calories": int(macro_adherence["calories_within_5pct"].notna().sum()),
+            "total_days_with_calories": int(
+                macro_adherence["calories_within_5pct"].notna().sum()
+            ),
             "days_meeting_protein": int(macro_adherence["protein_met"].sum()),
-            "total_days_with_protein": int(macro_adherence["protein_met"].notna().sum()),
+            "total_days_with_protein": int(
+                macro_adherence["protein_met"].notna().sum()
+            ),
         }
         st.caption("Adherence summary")
         st.write(adherence_summary)
 
-        # quick line chart for calories + protein
         cin_col = COLS["calories_in"]
         prot_col = COLS["protein_g"]
         chart_df = macro_adherence.set_index("date")[[cin_col, prot_col]]
@@ -406,9 +378,11 @@ else:
     else:
         st.dataframe(training_summary)
 
-        # charts if tonnage / sets available
         ts_chart = training_summary.set_index("week_start")
-        metric_cols = [c for c in ["hevy_volume_total", "hevy_sets_total", "steps_avg"]
-                       if c in ts_chart.columns]
+        metric_cols = [
+            c
+            for c in ["hevy_volume_total", "hevy_sets_total", "steps_avg"]
+            if c in ts_chart.columns
+        ]
         if metric_cols:
             st.bar_chart(ts_chart[metric_cols])
