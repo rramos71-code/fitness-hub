@@ -1,5 +1,5 @@
 import streamlit as st
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -11,56 +11,34 @@ from clients.googlefit_client import GoogleFitClient
 from utils.daily_aggregation import build_daily_dataset
 
 # =========================================================
-# Client initialisation (safe, via session_state)
+#  Column mapping from unified daily_df
+#  >>> ADAPT THESE NAMES ONCE TO MATCH YOUR build_daily_dataset <<<
 # =========================================================
+COLS = {
+    # nutrition (from Google Fit)
+    "calories_in": "calories_kcal",
+    "protein_g": "protein_g",
+    "carbs_g": "carbs_g",
+    "fat_g": "fat_g",
 
-def init_clients():
-    # -------- Hevy --------
-    if "hevy_client" not in st.session_state and "hevy_client_error" not in st.session_state:
-        try:
-            st.session_state["hevy_client"] = HevyClient()
-        except Exception as e:
-            st.session_state["hevy_client"] = None
-            st.session_state["hevy_client_error"] = str(e)
+    # activity / energy out (from Garmin)
+    # adjust these to whatever your daily aggregation uses
+    "calories_out": "garmin_calories_kcal",      # e.g. active + resting, or active only
+    "steps": "garmin_steps",
+    "sleep_hours": "garmin_sleep_hours",
 
-    # -------- Garmin --------
-    if "garmin_client" not in st.session_state and "garmin_client_error" not in st.session_state:
-        try:
-            st.session_state["garmin_client"] = GarminClient()
-        except Exception as e:
-            st.session_state["garmin_client"] = None
-            st.session_state["garmin_client_error"] = str(e)
-
-    # -------- Google Fit --------
-    if "gf_client" not in st.session_state and "gf_client_error" not in st.session_state:
-        try:
-            st.session_state["gf_client"] = GoogleFitClient()
-        except Exception as e:
-            st.session_state["gf_client"] = None
-            st.session_state["gf_client_error"] = str(e)
-
-
-init_clients()
-
-hevy_client = st.session_state.get("hevy_client")
-garmin_client = st.session_state.get("garmin_client")
-gf_client = st.session_state.get("gf_client")
-
-hevy_err = st.session_state.get("hevy_client_error")
-garmin_err = st.session_state.get("garmin_client_error")
-gf_err = st.session_state.get("gf_client_error")
+    # resistance training (from Hevy aggregated per day)
+    "hevy_sets": "hevy_sets",                    # total sets per day
+    "hevy_volume": "hevy_volume_kg",             # total tonnage per day
+}
 
 # =========================================================
-# (Optional) helper if you still want raw → df conversion
+# Helper: Google Fit raw -> daily macros
+# (kept here in case we want to debug raw responses later)
 # =========================================================
-
 def aggregate_googlefit_macros(raw: dict, tz_name: str = "Europe/Berlin"):
-    """
-    Turn raw Google Fit aggregate JSON into a daily macros DataFrame.
-    (not used by main flow now, but kept for debugging if needed)
-    """
     tz = ZoneInfo(tz_name)
-    per_day = {}  # date -> dict with totals
+    per_day = {}
 
     for b in raw.get("bucket", []):
         for ds in b.get("dataset", []):
@@ -114,141 +92,192 @@ def aggregate_googlefit_macros(raw: dict, tz_name: str = "Europe/Berlin"):
 
 
 # =========================================================
+# Tier-1 analytics helpers
+# =========================================================
+def _ensure_date_and_week(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    out["date"] = pd.to_datetime(out["date"])
+    # week_start = Monday of that week
+    out["week_start"] = out["date"] - pd.to_timedelta(out["date"].dt.weekday, unit="D")
+    return out
+
+
+def build_weekly_energy_summary(daily_df: pd.DataFrame) -> pd.DataFrame:
+    df = _ensure_date_and_week(daily_df)
+
+    cin_col = COLS["calories_in"]
+    cout_col = COLS["calories_out"]
+
+    if cin_col not in df.columns and cout_col not in df.columns:
+        return pd.DataFrame()
+
+    group = df.groupby("week_start")
+    rows = []
+
+    for week, g in group:
+        row = {
+            "week_start": week.date(),
+            "days_with_data": len(g),
+        }
+
+        if cin_col in g.columns:
+            row["calories_in_sum"] = g[cin_col].sum()
+            row["calories_in_avg"] = g[cin_col].mean()
+        if cout_col in g.columns:
+            row["calories_out_sum"] = g[cout_col].sum()
+            row["calories_out_avg"] = g[cout_col].mean()
+
+        if ("calories_in_sum" in row) and ("calories_out_sum" in row):
+            row["energy_balance_sum"] = row["calories_in_sum"] - row["calories_out_sum"]
+
+        rows.append(row)
+
+    return pd.DataFrame(rows).sort_values("week_start").reset_index(drop=True)
+
+
+def build_macro_adherence(daily_df: pd.DataFrame,
+                          target_calories: float,
+                          target_protein: float) -> pd.DataFrame:
+    df = daily_df.copy()
+    cin_col = COLS["calories_in"]
+    prot_col = COLS["protein_g"]
+
+    if cin_col not in df.columns and prot_col not in df.columns:
+        return pd.DataFrame()
+
+    df["date"] = pd.to_datetime(df["date"]).dt.date
+
+    if cin_col in df.columns:
+        df["calories_delta"] = df[cin_col] - target_calories
+        df["calories_within_5pct"] = (
+            df[cin_col].between(0.95 * target_calories, 1.05 * target_calories)
+        )
+
+    if prot_col in df.columns:
+        df["protein_delta"] = df[prot_col] - target_protein
+        df["protein_met"] = df[prot_col] >= target_protein
+
+    return df[["date", cin_col, prot_col,
+               "calories_delta", "calories_within_5pct",
+               "protein_delta", "protein_met"]].copy()
+
+
+def build_training_load_summary(daily_df: pd.DataFrame) -> pd.DataFrame:
+    df = _ensure_date_and_week(daily_df)
+
+    sets_col = COLS["hevy_sets"]
+    volume_col = COLS["hevy_volume"]
+    steps_col = COLS["steps"]
+
+    if (sets_col not in df.columns and
+        volume_col not in df.columns and
+        steps_col not in df.columns):
+        return pd.DataFrame()
+
+    # training day flag: Hevy sets OR high-steps day
+    df["is_hevy_day"] = df[sets_col] > 0 if sets_col in df.columns else False
+    if steps_col in df.columns:
+        df["is_high_step_day"] = df[steps_col] >= 8000
+    else:
+        df["is_high_step_day"] = False
+
+    df["is_training_day"] = df["is_hevy_day"] | df["is_high_step_day"]
+
+    group = df.groupby("week_start")
+    rows = []
+
+    for week, g in group:
+        row = {
+            "week_start": week.date(),
+            "days": len(g),
+            "training_days": int(g["is_training_day"].sum()),
+        }
+        if sets_col in g.columns:
+            row["hevy_sets_total"] = g[sets_col].sum()
+        if volume_col in g.columns:
+            row["hevy_volume_total"] = g[volume_col].sum()
+        if steps_col in g.columns:
+            row["steps_avg"] = g[steps_col].mean()
+
+        rows.append(row)
+
+    return pd.DataFrame(rows).sort_values("week_start").reset_index(drop=True)
+
+
+# =========================================================
+# Instantiate API clients
+# =========================================================
+hevy_client = HevyClient()
+garmin_client = GarminClient()
+gf_client = GoogleFitClient()
+
+# =========================================================
 # UI
 # =========================================================
-
 st.title("Fitness Hub — Core Integrations Test")
 
 # ----------------------- Hevy ----------------------------
-
 st.header("Hevy Connection")
 
-if hevy_err:
-    st.warning(f"Hevy client not available: {hevy_err}")
-
 if st.button("Sync Hevy workouts"):
-    if hevy_client is None:
-        st.error("Hevy client not initialised. Check your HEVY_API_KEY configuration.")
-    else:
-        try:
-            workouts_df, sets_df = hevy_client.sync_workouts()
-            st.session_state["hevy_sets_df"] = sets_df
+    try:
+        workouts_df, sets_df = hevy_client.sync_workouts()
+        st.session_state["hevy_sets_df"] = sets_df
 
-            st.success(f"Hevy connection OK, {len(workouts_df)} workouts retrieved")
-            st.subheader("Hevy sets (sample)")
-            st.dataframe(sets_df.head())
-        except Exception as e:
-            st.error(f"Hevy error: {e}")
+        st.success(f"Hevy connection OK, {len(workouts_df)} workouts retrieved")
+        st.subheader("Hevy sets (sample)")
+        st.dataframe(sets_df.head())
+    except Exception as e:
+        st.error(f"Hevy error: {e}")
 
 # ----------------------- Garmin --------------------------
-
 st.header("Garmin Connection")
 
-if garmin_err:
-    st.warning(f"Garmin client not available: {garmin_err}")
-
 if st.button("Test Garmin"):
-    if garmin_client is None:
-        st.error("Garmin client not initialised. Check GARMIN_EMAIL / GARMIN_PASSWORD.")
-    else:
-        try:
-            daily_df, activities_df = garmin_client.fetch_daily_and_activities()
-            st.session_state["garmin_daily_df"] = daily_df
-            st.session_state["garmin_activities_df"] = activities_df
+    try:
+        daily_df_gar, activities_df = garmin_client.fetch_daily_and_activities()
+        st.session_state["garmin_daily_df"] = daily_df_gar
+        st.session_state["garmin_activities_df"] = activities_df
 
-            st.write("Daily")
-            st.dataframe(daily_df.head())
+        st.write("Daily")
+        st.dataframe(daily_df_gar.head())
 
-            st.write("Activities")
-            st.dataframe(activities_df.head())
-        except Exception as e:
-            st.error(f"Garmin error: {e}")
+        st.write("Activities")
+        st.dataframe(activities_df.head())
+    except Exception as e:
+        st.error(f"Garmin error: {e}")
 
 # ----------------------- Google Fit ----------------------
-
 st.header("Google Fit Connection")
 
-if gf_err:
-    st.warning(f"Google Fit client not available: {gf_err}")
-
-days_back = st.number_input(
-    "Days back", min_value=1, max_value=30, value=7, step=1
-)
+days_back = st.number_input("Days back", min_value=1, max_value=30, value=7, step=1)
 
 if st.button("Test Google Fit nutrition"):
-    if gf_client is None:
-        st.error("Google Fit client not initialised. Check your Google Fit secrets.")
-    else:
-        try:
-            df = gf_client.aggregate_daily_macros(days_back=days_back)
-            st.session_state["googlefit_nutrition_df"] = df
+    try:
+        df_gf = gf_client.aggregate_daily_macros(days_back=days_back)
+        st.session_state["googlefit_nutrition_df"] = df_gf
 
-            if df.empty:
-                st.info("Google Fit returned no nutrition entries for the selected period.")
-            else:
-                st.dataframe(df)
-        except Exception as e:
-            st.error(f"Google Fit error: {e}")
+        if df_gf.empty:
+            st.info("Google Fit returned no nutrition entries for the selected period.")
+        else:
+            st.dataframe(df_gf)
+    except Exception as e:
+        st.error(f"Google Fit error: {e}")
 
 if st.button("Debug raw Google Fit aggregate response"):
-    if gf_client is None:
-        st.error("Google Fit client not initialised. Check your Google Fit secrets.")
-    else:
-        try:
-            raw = gf_client.debug_aggregate_raw(days_back=days_back)
-            st.json(raw)
-        except Exception as e:
-            st.error(f"Google Fit debug error: {e}")
+    try:
+        raw = gf_client.debug_aggregate_raw(days_back=days_back)
+        st.json(raw)
+    except Exception as e:
+        st.error(f"Google Fit debug error: {e}")
 
-# -------------------- Unified daily view -----------------
-
-def _ensure_date_column(df, candidates):
-    """
-    Make sure the dataframe has a 'date' column.
-
-    - If 'date' already exists, leave it.
-    - Otherwise, try each candidate column name, convert to datetime,
-      and take the .date() part.
-    - If nothing works, return an empty DataFrame to avoid KeyError
-      in the daily aggregation.
-    """
-    if df is None or getattr(df, "empty", True):
-        return df
-
-    if "date" in df.columns:
-        # normalise to date only, just in case it’s datetime
-        df = df.copy()
-        df["date"] = pd.to_datetime(df["date"]).dt.date
-        return df
-
-    for col in candidates:
-        if col in df.columns:
-            df = df.copy()
-            df["date"] = pd.to_datetime(df[col]).dt.date
-            return df
-
-    # No usable date column found; better to drop this df than to crash
-    return pd.DataFrame()
-
-# =================== Unified daily view ==================
+# ------------------- Unified daily view ------------------
 st.subheader("Daily overview (unified dataset)")
 
 nutrition_df = st.session_state.get("googlefit_nutrition_df")
 garmin_daily_df = st.session_state.get("garmin_daily_df")
 garmin_activities_df = st.session_state.get("garmin_activities_df")
 hevy_sets_df = st.session_state.get("hevy_sets_df")
-
-# Standardise 'date' column for all sources
-nutrition_df = _ensure_date_column(nutrition_df, ["date"])
-garmin_daily_df = _ensure_date_column(garmin_daily_df, ["calendarDate"])
-garmin_activities_df = _ensure_date_column(
-    garmin_activities_df,
-    ["startTimeLocal", "startTimeGMT", "start_time"],
-)
-hevy_sets_df = _ensure_date_column(
-    hevy_sets_df,
-    ["performed_at", "start_time"],
-)
 
 if (
     (nutrition_df is None or nutrition_df.empty)
@@ -260,6 +289,7 @@ if (
         "Load data from at least one source (Google Fit, Garmin, Hevy) "
         "to see the unified daily dataset."
     )
+    daily_df = None
 else:
     try:
         daily_df = build_daily_dataset(
@@ -268,6 +298,7 @@ else:
             garmin_activities_df=garmin_activities_df,
             hevy_sets_df=hevy_sets_df,
         )
+        st.session_state["daily_df"] = daily_df
         st.dataframe(daily_df)
 
         st.caption("Rows per source:")
@@ -283,4 +314,101 @@ else:
             }
         )
     except Exception as e:
+        daily_df = None
         st.error(f"Daily aggregation error: {e}")
+
+# =========================================================
+#              TIER-1 ANALYTICS SECTION
+# =========================================================
+st.header("Tier-1 analytics")
+
+daily_df = st.session_state.get("daily_df")
+
+if daily_df is None or daily_df.empty:
+    st.info("Generate the unified daily dataset first to see analytics.")
+else:
+    with st.expander("Debug: available daily_df columns", expanded=False):
+        st.write(list(daily_df.columns))
+
+    # ---- Targets for adherence (can tune later / store in settings) ----
+    st.subheader("Targets")
+    col1, col2 = st.columns(2)
+    with col1:
+        target_calories = st.number_input(
+            "Target daily calories (kcal)",
+            min_value=1000,
+            max_value=5000,
+            value=2300,
+            step=50,
+        )
+    with col2:
+        target_protein = st.number_input(
+            "Target daily protein (g)",
+            min_value=40,
+            max_value=300,
+            value=160,
+            step=5,
+        )
+
+    # ---- 1. Weekly energy balance ----
+    st.subheader("1. Weekly energy balance")
+
+    weekly_energy = build_weekly_energy_summary(daily_df)
+    if weekly_energy.empty:
+        st.info("No calories_in / calories_out columns found for energy balance.")
+    else:
+        st.dataframe(weekly_energy)
+        # Simple charts if both in & out exist
+        if {"calories_in_avg", "calories_out_avg"}.issubset(weekly_energy.columns):
+            chart_df = weekly_energy.set_index("week_start")[[
+                "calories_in_avg",
+                "calories_out_avg",
+            ]]
+            st.line_chart(chart_df)
+
+        if "energy_balance_sum" in weekly_energy.columns:
+            st.bar_chart(
+                weekly_energy.set_index("week_start")[["energy_balance_sum"]]
+            )
+
+    # ---- 2. Macro adherence vs targets ----
+    st.subheader("2. Macro adherence vs targets")
+
+    macro_adherence = build_macro_adherence(
+        daily_df, target_calories=target_calories, target_protein=target_protein
+    )
+    if macro_adherence.empty:
+        st.info("No nutrition columns found for macro adherence.")
+    else:
+        st.dataframe(macro_adherence)
+
+        adherence_summary = {
+            "days_in_range_calories_±5%": int(macro_adherence["calories_within_5pct"].sum()),
+            "total_days_with_calories": int(macro_adherence["calories_within_5pct"].notna().sum()),
+            "days_meeting_protein": int(macro_adherence["protein_met"].sum()),
+            "total_days_with_protein": int(macro_adherence["protein_met"].notna().sum()),
+        }
+        st.caption("Adherence summary")
+        st.write(adherence_summary)
+
+        # quick line chart for calories + protein
+        cin_col = COLS["calories_in"]
+        prot_col = COLS["protein_g"]
+        chart_df = macro_adherence.set_index("date")[[cin_col, prot_col]]
+        st.line_chart(chart_df)
+
+    # ---- 3. Weekly training load & frequency ----
+    st.subheader("3. Weekly training load & frequency")
+
+    training_summary = build_training_load_summary(daily_df)
+    if training_summary.empty:
+        st.info("No Hevy / steps columns found for training load.")
+    else:
+        st.dataframe(training_summary)
+
+        # charts if tonnage / sets available
+        ts_chart = training_summary.set_index("week_start")
+        metric_cols = [c for c in ["hevy_volume_total", "hevy_sets_total", "steps_avg"]
+                       if c in ts_chart.columns]
+        if metric_cols:
+            st.bar_chart(ts_chart[metric_cols])
