@@ -360,7 +360,7 @@ if st.button("Debug raw Google Fit aggregate response"):
     except Exception as e:
         st.error(f"Google Fit debug error: {e}")
 
-# ------------------- Unified daily view ------------------
+# =================== Unified daily view ==================
 st.subheader("Daily overview (unified dataset)")
 
 nutrition_df = st.session_state.get("googlefit_nutrition_df")
@@ -369,16 +369,16 @@ garmin_activities_df = st.session_state.get("garmin_activities_df")
 hevy_sets_df = st.session_state.get("hevy_sets_df")
 
 if (
-    (nutrition_df is None or (hasattr(nutrition_df, "empty") and nutrition_df.empty))
-    and (garmin_daily_df is None or (hasattr(garmin_daily_df, "empty") and garmin_daily_df.empty))
-    and (garmin_activities_df is None or (hasattr(garmin_activities_df, "empty") and garmin_activities_df.empty))
-    and (hevy_sets_df is None or (hasattr(hevy_sets_df, "empty") and hevy_sets_df.empty))
+    (nutrition_df is None or nutrition_df.empty)
+    and (garmin_daily_df is None or garmin_daily_df.empty)
+    and (garmin_activities_df is None or garmin_activities_df.empty)
+    and (hevy_sets_df is None or hevy_sets_df.empty)
 ):
     st.info(
         "Load data from at least one source (Google Fit, Garmin, Hevy) "
         "to see the unified daily dataset."
     )
-    daily_df = None
+    st.session_state["daily_df"] = None
 else:
     try:
         daily_df = build_daily_dataset(
@@ -387,7 +387,10 @@ else:
             garmin_activities_df=garmin_activities_df,
             hevy_sets_df=hevy_sets_df,
         )
+
+        # store for Tier-1 analytics
         st.session_state["daily_df"] = daily_df
+
         st.dataframe(daily_df)
 
         st.caption("Rows per source:")
@@ -403,12 +406,13 @@ else:
             }
         )
     except Exception as e:
-        daily_df = None
+        st.session_state["daily_df"] = None
         st.error(f"Daily aggregation error: {e}")
 
 # =========================================================
 #              TIER-1 ANALYTICS SECTION
 # =========================================================
+# ====================== Tier-1 analytics =====================
 st.header("Tier-1 analytics")
 
 daily_df = st.session_state.get("daily_df")
@@ -416,103 +420,143 @@ daily_df = st.session_state.get("daily_df")
 if daily_df is None or daily_df.empty:
     st.info("Generate the unified daily dataset first to see analytics.")
 else:
-    with st.expander("Debug: available daily_df columns", expanded=False):
-        st.write(list(daily_df.columns))
+    # Work on a copy and normalize date dtype
+    df = daily_df.copy()
+    df["date"] = pd.to_datetime(df["date"])
 
-    # ---- Targets for adherence ----
-    st.subheader("Targets")
-    col1, col2 = st.columns(2)
-    with col1:
-        target_calories = st.number_input(
-            "Target daily calories (kcal)",
-            min_value=1000,
-            max_value=5000,
-            value=2300,
-            step=50,
+    # Convenience series with NaN handled
+    calories = df.get("calories_kcal", pd.Series(dtype=float)).fillna(0.0)
+    g_calories = df.get("garmin_calories_kcal", pd.Series(dtype=float)).fillna(0.0)
+    protein = df.get("protein_g", pd.Series(dtype=float)).fillna(0.0)
+    carbs = df.get("carbs_g", pd.Series(dtype=float)).fillna(0.0)
+    fat = df.get("fat_g", pd.Series(dtype=float)).fillna(0.0)
+    steps = df.get("garmin_steps", pd.Series(dtype=float)).fillna(0.0)
+
+    # 1 - KPI snapshot
+    st.subheader("KPI snapshot")
+
+    total_days = len(df)
+    tracked_days = int((calories > 0).sum())
+    avg_kcal = calories[calories > 0].mean() if (calories > 0).any() else 0
+    avg_protein = protein[protein > 0].mean() if (protein > 0).any() else 0
+    avg_steps = steps[steps > 0].mean() if (steps > 0).any() else 0
+
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        st.metric("Tracked nutrition days", f"{tracked_days} / {total_days}")
+    with c2:
+        st.metric("Avg intake (kcal)", f"{avg_kcal:,.0f}")
+    with c3:
+        st.metric("Avg protein (g)", f"{avg_protein:,.0f}")
+    with c4:
+        st.metric("Avg steps per day", f"{avg_steps:,.0f}")
+
+    # 2 - Weekly summaries
+    st.subheader("Weekly summaries")
+
+    weekly = (
+        df.set_index("date")
+        .resample("W-MON")  # weeks ending on Monday (so week label is Monday)
+        .agg(
+            {
+                "calories_kcal": "mean",
+                "protein_g": "mean",
+                "carbs_g": "mean",
+                "fat_g": "mean",
+                "garmin_calories_kcal": "mean",
+                "garmin_steps": "mean",
+            }
         )
-    with col2:
-        target_protein = st.number_input(
-            "Target daily protein (g)",
-            min_value=40,
-            max_value=300,
-            value=160,
-            step=5,
+        .rename(
+            columns={
+                "calories_kcal": "avg_kcal",
+                "protein_g": "avg_protein",
+                "carbs_g": "avg_carbs",
+                "fat_g": "avg_fat",
+                "garmin_calories_kcal": "avg_garmin_kcal",
+                "garmin_steps": "avg_steps",
+            }
         )
-
-    # ---- 1. Weekly energy balance ----
-    st.subheader("1. Weekly energy balance")
-
-    weekly_energy = build_weekly_energy_summary(daily_df)
-    if weekly_energy.empty:
-        st.info("No calories_in / calories_out columns found for energy balance.")
-    else:
-        st.dataframe(weekly_energy)
-        if {"calories_in_avg", "calories_out_avg"}.issubset(weekly_energy.columns):
-            chart_df = weekly_energy.set_index("week_start")[
-                ["calories_in_avg", "calories_out_avg"]
-            ]
-            st.line_chart(chart_df)
-
-        if "energy_balance_sum" in weekly_energy.columns:
-            st.bar_chart(
-                weekly_energy.set_index("week_start")[["energy_balance_sum"]]
-            )
-
-    # ---- 2. Macro adherence vs targets ----
-    st.subheader("2. Macro adherence vs targets")
-
-    macro_adherence = build_macro_adherence(
-        daily_df, target_calories=target_calories, target_protein=target_protein
+        .reset_index()
     )
-    if macro_adherence.empty:
-        st.info("No nutrition columns found for macro adherence.")
+
+    # Make week label nice
+    weekly["week"] = weekly["date"].dt.strftime("%Y-W%U")
+    weekly_view = weekly[
+        ["week", "avg_kcal", "avg_protein", "avg_carbs", "avg_fat", "avg_steps"]
+    ].round(1)
+
+    st.dataframe(weekly_view, use_container_width=True)
+
+    # 3 - Time series charts
+    st.subheader("Trends")
+
+    chart_cols = st.columns(2)
+
+    with chart_cols[0]:
+        st.markdown("**Calories and steps over time**")
+        chart_df = df[["date"]].copy()
+        chart_df["intake_kcal"] = calories
+        chart_df["garmin_kcal"] = g_calories
+        chart_df["steps"] = steps
+        chart_df = chart_df.set_index("date")
+        st.line_chart(chart_df)
+
+    with chart_cols[1]:
+        st.markdown("**Macros over time**")
+        macro_df = df[["date"]].copy()
+        macro_df["protein_g"] = protein
+        macro_df["carbs_g"] = carbs
+        macro_df["fat_g"] = fat
+        macro_df = macro_df.set_index("date")
+        st.line_chart(macro_df)
+
+    # 4 - Basic correlations
+    st.subheader("Basic correlations")
+
+    corr_rows = []
+
+    if len(calories[calories > 0]) >= 3 and len(steps[steps > 0]) >= 3:
+        corr_steps_kcal = calories.corr(steps)
+        corr_rows.append(
+            {"pair": "Calories vs steps", "correlation": corr_steps_kcal}
+        )
+
+    if len(calories[calories > 0]) >= 3 and len(g_calories[g_calories > 0]) >= 3:
+        corr_intake_vs_garmin = calories.corr(g_calories)
+        corr_rows.append(
+            {"pair": "Intake kcal vs Garmin kcal", "correlation": corr_intake_vs_garmin}
+        )
+
+    # Optional - if you later add training volume columns from Hevy,
+    # you can extend correlations here, guarded by column checks.
+
+    if corr_rows:
+        corr_df = pd.DataFrame(corr_rows)
+        corr_df["correlation"] = corr_df["correlation"].round(2)
+        st.table(corr_df)
     else:
-        st.dataframe(macro_adherence)
+        st.info("Not enough overlapping data to compute correlations yet.")
 
-        adherence_summary = {
-            "days_in_range_calories_±5%": int(
-                macro_adherence["calories_within_5pct"].sum()
-            )
-            if "calories_within_5pct" in macro_adherence.columns
-            else 0,
-            "total_days_with_calories": int(
-                macro_adherence["calories_within_5pct"].notna().sum()
-            )
-            if "calories_within_5pct" in macro_adherence.columns
-            else 0,
-            "days_meeting_protein": int(macro_adherence["protein_met"].sum())
-            if "protein_met" in macro_adherence.columns
-            else 0,
-            "total_days_with_protein": int(
-                macro_adherence["protein_met"].notna().sum()
-            )
-            if "protein_met" in macro_adherence.columns
-            else 0,
-        }
-        st.caption("Adherence summary")
-        st.write(adherence_summary)
+    # 5 - Best and worst days
+    st.subheader("Best and worst days")
 
-        cin_col = COLS["calories_in"]
-        prot_col = COLS["protein_g"]
-        plot_cols = [c for c in [cin_col, prot_col] if c in macro_adherence.columns]
-        if plot_cols:
-            chart_df = macro_adherence.set_index("date")[plot_cols]
-            st.line_chart(chart_df)
+    if (calories > 0).any():
+        best_kcal_day = df.loc[calories.idxmin(), "date"].date()
+        worst_kcal_day = df.loc[calories.idxmax(), "date"].date()
+        st.write(
+            f"- Lowest calorie day: **{best_kcal_day}** with {calories.min():.0f} kcal"
+        )
+        st.write(
+            f"- Highest calorie day: **{worst_kcal_day}** with {calories.max():.0f} kcal"
+        )
 
-    # ---- 3. Weekly training load & frequency ----
-    st.subheader("3. Weekly training load & frequency")
+    if (steps > 0).any():
+        best_steps_day = df.loc[steps.idxmax(), "date"].date()
+        st.write(
+            f"- Highest steps day: **{best_steps_day}** with {steps.max():,.0f} steps"
+        )
 
-    training_summary = build_training_load_summary(daily_df)
-    if training_summary.empty:
-        st.info("No Hevy / steps columns found for training load.")
-    else:
-        st.dataframe(training_summary)
-
-        ts_chart = training_summary.set_index("week_start")
-        metric_cols = [
-            c
-            for c in ["hevy_volume_total", "hevy_sets_total", "steps_avg"]
-            if c in ts_chart.columns
-        ]
-        if metric_cols:
-            st.bar_chart(ts_chart[metric_cols])
+    # 6 - Debug helper
+    with st.expander("Debug: available daily_df columns"):
+        st.write(list(df.columns))
