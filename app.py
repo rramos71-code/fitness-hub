@@ -560,3 +560,153 @@ else:
     # 6 - Debug helper
     with st.expander("Debug: available daily_df columns"):
         st.write(list(df.columns))
+
+
+# ====================== Tier-2 Insights (Intelligent Patterns) ======================
+st.header("Tier-2 Insights")
+
+daily_df = st.session_state.get("daily_df")
+
+if daily_df is None or daily_df.empty:
+    st.info("Load the unified daily dataset first to generate insights.")
+else:
+    df = daily_df.copy()
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.sort_values("date")
+
+    # Extract useful series
+    kcal_in = df["calories_kcal"].fillna(0)
+    kcal_out = df["garmin_calories_kcal"].fillna(0)
+    protein = df["protein_g"].fillna(0)
+    steps = df["garmin_steps"].fillna(0)
+
+    # Rolling windows
+    last7 = df.tail(7)
+    last14 = df.tail(14)
+
+    # -----------------------------
+    # HIGH-LEVEL INSIGHTS FEED
+    # -----------------------------
+    st.subheader("Insights Feed")
+
+    insights = []
+
+    # 1. Energy balance trend
+    if (last7["calories_kcal"] > 0).sum() >= 3:
+        avg_in = last7["calories_kcal"].mean()
+        avg_out = last7["garmin_calories_kcal"].mean() if (last7["garmin_calories_kcal"] > 0).any() else None
+
+        if avg_out:
+            net = avg_in - avg_out
+            if net < -200:
+                insights.append(f"You're in a consistent **weekly deficit** (~{abs(net):.0f} kcal/day). Suitable for fat loss.")
+            elif net > 200:
+                insights.append(f"You're in a **weekly surplus** (~{net:.0f} kcal/day). Suitable for muscle gain.")
+            else:
+                insights.append("Your weekly energy balance is **near maintenance**.")
+
+    # 2. Protein compliance
+    if (last7["protein_g"] > 0).any():
+        p_mean = last7["protein_g"].mean()
+        days_high_protein = (last7["protein_g"] >= 130).sum()  # example threshold
+        insights.append(
+            f"Protein intake averages **{p_mean:.0f} g/day**, with {days_high_protein}/7 days above target."
+        )
+
+    # 3. Steps trend
+    if (last7["garmin_steps"] > 0).any():
+        steps_mean = last7["garmin_steps"].mean()
+        prev7 = df.tail(14).head(7)
+        if (prev7["garmin_steps"] > 0).any():
+            delta = steps_mean - prev7["garmin_steps"].mean()
+            if delta > 1000:
+                insights.append("Your daily steps are **trending upward** compared to last week.")
+            elif delta < -1000:
+                insights.append("Your daily steps are **trending downward** compared to last week.")
+            else:
+                insights.append("Steps are stable week-over-week.")
+
+    # 4. High-burn days and fueling mismatch
+    if (kcal_out > 0).any():
+        heavy_days = df[df["garmin_calories_kcal"] > 600]
+        if not heavy_days.empty:
+            # look for underfed days among them
+            underfed = heavy_days[heavy_days["calories_kcal"] < heavy_days["garmin_calories_kcal"] - 300]
+            if not underfed.empty:
+                d = underfed.iloc[-1]["date"].date()
+                insights.append(
+                    f"On **{d}**, you had a high-burn day with **insufficient fueling**. Consider increasing carbs on such days."
+                )
+
+    # 5. Weekend pattern detection
+    weekend = df[df["date"].dt.weekday >= 5]
+    if not weekend.empty:
+        w_kcal = weekend["calories_kcal"].mean()
+        wd_kcal = df[df["date"].dt.weekday < 5]["calories_kcal"].mean()
+        if w_kcal < wd_kcal - 200:
+            insights.append("You tend to **undereat on weekends** compared to weekdays.")
+        elif w_kcal > wd_kcal + 200:
+            insights.append("You tend to **overeat on weekends** compared to weekdays.")
+
+    # Display insights
+    if not insights:
+        st.info("No significant patterns detected yet.")
+    else:
+        for insight in insights:
+            st.markdown(f"• {insight}")
+
+    # -----------------------------
+    # FLAGS (Red / Amber / Green)
+    # -----------------------------
+    st.subheader("Health & Performance Flags")
+
+    flags = []
+
+    # Red flags
+    if avg_in < 1400:
+        flags.append(("red", "Daily intake very low — risk of under-fueling."))
+    if protein.mean() < 90:
+        flags.append(("red", "Protein intake consistently low — prioritize protein-rich meals."))
+
+    # Amber flags
+    if steps_mean < 6000:
+        flags.append(("amber", "Low activity trend — steps have been below 6000 on average."))
+
+    # Green flags
+    if avg_in > 1800 and protein.mean() > 120:
+        flags.append(("green", "Nutrition profile supports strength and recovery."))
+
+    # Render flags
+    for level, msg in flags:
+        if level == "red":
+            st.error(msg)
+        elif level == "amber":
+            st.warning(msg)
+        elif level == "green":
+            st.success(msg)
+
+    # -----------------------------
+    # Special patterns
+    # -----------------------------
+    st.subheader("Patterns Detected")
+
+    patterns = []
+
+    # Low protein streak
+    lowp = (df["protein_g"] < 100).rolling(3).sum()
+    if (lowp == 3).any():
+        patterns.append("3-day **low protein streak** detected.")
+
+    # Calorie under-reporting days
+    if (df["calories_kcal"] == 0).sum() >= 2:
+        patterns.append("Several days with **no nutrition logged** — insights may be incomplete.")
+
+    # Steps inconsistency
+    if df["garmin_steps"].std() > 5000:
+        patterns.append("High variability in step count — inconsistent daily movement.")
+
+    if not patterns:
+        st.info("No notable patterns this week.")
+    else:
+        for p in patterns:
+            st.write(f"• {p}")
