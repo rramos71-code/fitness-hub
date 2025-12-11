@@ -1,8 +1,10 @@
-import streamlit as st
-from datetime import datetime, timezone
+import json
+from pathlib import Path
+from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import pandas as pd
+import streamlit as st
 
 # ---- Local modules ----
 from clients.hevy_client import HevyClient
@@ -29,6 +31,152 @@ COLS = {
     "hevy_volume": "hevy_volume_kg",
 }
 
+# Where we persist per-user goals locally
+GOAL_STORE_PATH = Path("user_goals.json")
+
+
+# =========================================================
+# Goal helpers
+# =========================================================
+def _safe_parse_date(raw) -> date | None:
+    if raw is None or raw == "":
+        return None
+    try:
+        return datetime.fromisoformat(str(raw)).date()
+    except Exception:
+        return None
+
+
+def _default_goal_dates() -> tuple[date, date | None]:
+    start = date.today() - timedelta(days=28)
+    return start, None
+
+
+def load_goal_store() -> dict:
+    if not GOAL_STORE_PATH.exists():
+        return {}
+    try:
+        with GOAL_STORE_PATH.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_goal_store(store: dict) -> None:
+    try:
+        with GOAL_STORE_PATH.open("w", encoding="utf-8") as f:
+            json.dump(store, f, indent=2)
+    except Exception as exc:
+        st.warning(f"Could not persist goals: {exc}")
+
+
+def load_user_goal(user_id: str) -> dict:
+    store = load_goal_store()
+    raw = store.get(user_id) or {}
+
+    start_default, end_default = _default_goal_dates()
+
+    return {
+        "target_calories": raw.get("target_calories", 2300.0),
+        "target_protein": raw.get("target_protein", 140.0),
+        "target_steps": raw.get("target_steps", 8000),
+        "start_date": _safe_parse_date(raw.get("start_date")) or start_default,
+        "end_date": _safe_parse_date(raw.get("end_date")) or end_default,
+    }
+
+
+def save_user_goal(user_id: str, goal: dict) -> None:
+    store = load_goal_store()
+    payload = goal.copy()
+    payload["start_date"] = payload["start_date"].isoformat() if payload.get("start_date") else None
+    payload["end_date"] = payload["end_date"].isoformat() if payload.get("end_date") else None
+    store[user_id] = payload
+    save_goal_store(store)
+
+
+def apply_goal_columns(df: pd.DataFrame, goal: dict) -> pd.DataFrame:
+    if df is None or df.empty or goal is None:
+        return df
+
+    target_cal = goal.get("target_calories") or 0
+    target_protein = goal.get("target_protein") or 0
+    target_steps = goal.get("target_steps") or 0
+    start = goal.get("start_date")
+    end = goal.get("end_date")
+
+    out = df.copy()
+    out["date"] = pd.to_datetime(out["date"])
+    mask = out["date"].dt.date >= start if start else True
+    if isinstance(mask, bool):
+        mask = pd.Series(mask, index=out.index)
+    if end:
+        mask = mask & (out["date"].dt.date <= end)
+    out["goal_active"] = mask
+
+    if target_cal > 0 and "calories_kcal" in out.columns:
+        out["goal_calorie_delta"] = out["calories_kcal"] - target_cal
+        out["goal_calorie_met"] = out["calories_kcal"].between(
+            0.95 * target_cal, 1.05 * target_cal
+        )
+    else:
+        out["goal_calorie_delta"] = pd.NA
+        out["goal_calorie_met"] = False
+
+    if target_protein > 0 and "protein_g" in out.columns:
+        out["goal_protein_delta"] = out["protein_g"] - target_protein
+        out["goal_protein_met"] = out["protein_g"] >= target_protein
+    else:
+        out["goal_protein_delta"] = pd.NA
+        out["goal_protein_met"] = False
+
+    if target_steps > 0 and "garmin_steps" in out.columns:
+        out["goal_steps_delta"] = out["garmin_steps"] - target_steps
+        out["goal_steps_met"] = out["garmin_steps"] >= target_steps
+    else:
+        out["goal_steps_delta"] = pd.NA
+        out["goal_steps_met"] = False
+
+    out.loc[~out["goal_active"], ["goal_calorie_met", "goal_protein_met", "goal_steps_met"]] = False
+    return out
+
+
+def compute_weekly_with_goals(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    tmp = df.copy()
+    tmp["week_start"] = tmp["date"] - pd.to_timedelta(tmp["date"].dt.weekday, unit="D")
+
+    agg = tmp.groupby("week_start").agg(
+        avg_kcal=("calories_kcal", "mean"),
+        avg_protein=("protein_g", "mean"),
+        avg_steps=("garmin_steps", "mean"),
+        goal_kcal_delta=("goal_calorie_delta", "mean"),
+        goal_calorie_compliance=("goal_calorie_met", "mean"),
+        goal_protein_delta=("goal_protein_delta", "mean"),
+        goal_protein_compliance=("goal_protein_met", "mean"),
+        goal_steps_compliance=("goal_steps_met", "mean"),
+        days_with_data=("date", "count"),
+    )
+
+    agg = agg.reset_index().sort_values("week_start")
+    agg["week"] = agg["week_start"].dt.strftime("%Y-%m-%d")
+    return agg
+
+
+def streak_lengths(series: pd.Series) -> tuple[int, int]:
+    longest = 0
+    current = 0
+    for val in series.fillna(False).tolist():
+        if bool(val):
+            current += 1
+            longest = max(longest, current)
+        else:
+            current = 0
+    return current, longest
+
+
 # =========================================================
 # Helper utilities
 # =========================================================
@@ -51,7 +199,6 @@ def ensure_date_column(df: pd.DataFrame | None) -> pd.DataFrame | None:
             df["date"] = pd.to_datetime(df[cand]).dt.date
             return df
 
-    # last resort: if index looks like dates
     if isinstance(df.index, pd.DatetimeIndex):
         df["date"] = df.index.date
 
@@ -68,24 +215,17 @@ def _first_existing(df: pd.DataFrame, candidates) -> str | None:
 def build_daily_dataset(
     nutrition_df: pd.DataFrame | None,
     garmin_daily_df: pd.DataFrame | None,
-    garmin_activities_df: pd.DataFrame | None,  # currently unused but kept for future
+    garmin_activities_df: pd.DataFrame | None,
     hevy_sets_df: pd.DataFrame | None,
 ) -> pd.DataFrame:
-    """
-    Small, defensive unifier that creates a per-day DataFrame across
-    Google Fit nutrition, Garmin daily stats, and Hevy sets.
-    """
-
+    """Unify per-day DataFrame across Google Fit, Garmin, and Hevy."""
     frames = []
 
-    # ---------- Google Fit: nutrition ----------
     if nutrition_df is not None and not nutrition_df.empty:
         n = ensure_date_column(nutrition_df)
         if n is not None and not n.empty and "date" in n.columns:
             n = n.copy()
             n["date"] = pd.to_datetime(n["date"]).dt.date
-
-            # These are the columns produced by GoogleFitClient.aggregate_daily_macros
             agg_cols = {
                 "calories_kcal": "sum",
                 "protein_g": "sum",
@@ -94,24 +234,18 @@ def build_daily_dataset(
             }
             existing = {k: v for k, v in agg_cols.items() if k in n.columns}
             n = n.groupby("date", as_index=False).agg(existing)
-
-            # names already aligned with COLS mapping
             frames.append(n)
 
-    # ---------- Garmin: daily summary ----------
     if garmin_daily_df is not None and not garmin_daily_df.empty:
         g = ensure_date_column(garmin_daily_df)
         if g is not None and not g.empty and "date" in g.columns:
             g = g.copy()
             g["date"] = pd.to_datetime(g["date"]).dt.date
 
-            # Try to infer calories / steps / sleep columns from typical Garmin exports
             cal_col = _first_existing(
                 g, ["caloriesTotal", "calories_total", "activeKilocalories", "calories"]
             )
-            steps_col = _first_existing(
-                g, ["steps", "stepCount", "totalSteps"]
-            )
+            steps_col = _first_existing(g, ["steps", "stepCount", "totalSteps"])
             sleep_sec_col = _first_existing(
                 g, ["sleepingSeconds", "sleepDurationInSeconds", "sleepSeconds"]
             )
@@ -131,19 +265,14 @@ def build_daily_dataset(
                 g_day = g.groupby("date", as_index=False).agg(agg_spec)
 
                 if cal_col:
-                    g_day.rename(
-                        columns={cal_col: "garmin_calories_kcal"}, inplace=True
-                    )
+                    g_day.rename(columns={cal_col: "garmin_calories_kcal"}, inplace=True)
                 if steps_col:
                     g_day.rename(columns={steps_col: "garmin_steps"}, inplace=True)
                 if "sleep_hours_tmp" in g_day.columns:
-                    g_day.rename(
-                        columns={"sleep_hours_tmp": "garmin_sleep_hours"}, inplace=True
-                    )
+                    g_day.rename(columns={"sleep_hours_tmp": "garmin_sleep_hours"}, inplace=True)
 
                 frames.append(g_day)
 
-    # ---------- Hevy: sets ----------
     if hevy_sets_df is not None and not hevy_sets_df.empty:
         h = ensure_date_column(hevy_sets_df)
         if h is not None and not h.empty and "date" in h.columns:
@@ -174,10 +303,7 @@ def build_daily_dataset(
 
     from functools import reduce
 
-    daily = reduce(
-        lambda left, right: pd.merge(left, right, on="date", how="outer"), frames
-    )
-
+    daily = reduce(lambda left, right: pd.merge(left, right, on="date", how="outer"), frames)
     daily = daily.sort_values("date").reset_index(drop=True)
     return daily
 
@@ -259,17 +385,11 @@ def build_training_load_summary(daily_df: pd.DataFrame) -> pd.DataFrame:
     volume_col = COLS["hevy_volume"]
     steps_col = COLS["steps"]
 
-    if (sets_col not in df.columns and
-        volume_col not in df.columns and
-        steps_col not in df.columns):
+    if (sets_col not in df.columns and volume_col not in df.columns and steps_col not in df.columns):
         return pd.DataFrame()
 
     df["is_hevy_day"] = df[sets_col] > 0 if sets_col in df.columns else False
-    if steps_col in df.columns:
-        df["is_high_step_day"] = df[steps_col] >= 8000
-    else:
-        df["is_high_step_day"] = False
-
+    df["is_high_step_day"] = df[steps_col] >= 8000 if steps_col in df.columns else False
     df["is_training_day"] = df["is_hevy_day"] | df["is_high_step_day"]
 
     group = df.groupby("week_start")
@@ -300,10 +420,82 @@ hevy_client = HevyClient()
 garmin_client = GarminClient()
 gf_client = GoogleFitClient()
 
+
 # =========================================================
 # UI
 # =========================================================
-st.title("Fitness Hub — Core Integrations Test")
+st.title("Fitness Hub - Core Integrations Test")
+
+# ----------------------- Goals ----------------------------
+st.header("User and Goals")
+
+user_id_input = st.text_input("User id (used to save goals)", value=st.session_state.get("user_id", "default"))
+user_id = user_id_input.strip() or "default"
+st.session_state["user_id"] = user_id
+
+loaded_goal = load_user_goal(user_id)
+if "goal_config" not in st.session_state:
+    st.session_state["goal_config"] = loaded_goal
+current_goal = st.session_state.get("goal_config", loaded_goal)
+
+with st.form("goal_form"):
+    c_goal1, c_goal2, c_goal3 = st.columns(3)
+    with c_goal1:
+        target_cal = st.number_input(
+            "Daily calorie target (kcal)",
+            min_value=1000.0,
+            max_value=6000.0,
+            value=float(current_goal.get("target_calories", loaded_goal["target_calories"])),
+            step=50.0,
+        )
+    with c_goal2:
+        target_protein = st.number_input(
+            "Daily protein target (g)",
+            min_value=20.0,
+            max_value=400.0,
+            value=float(current_goal.get("target_protein", loaded_goal["target_protein"])),
+            step=5.0,
+        )
+    with c_goal3:
+        target_steps = st.number_input(
+            "Daily steps target",
+            min_value=1000,
+            max_value=30000,
+            value=int(current_goal.get("target_steps", loaded_goal["target_steps"])),
+            step=500,
+        )
+
+    start_date_input = st.date_input(
+        "Goal start date",
+        value=current_goal.get("start_date") or loaded_goal["start_date"],
+    )
+    use_end_date = st.checkbox("Set an end date", value=current_goal.get("end_date") is not None)
+    end_date_input = None
+    if use_end_date:
+        default_end = current_goal.get("end_date") or (start_date_input + timedelta(days=28))
+        end_date_input = st.date_input("Goal end date", value=default_end, min_value=start_date_input)
+
+    submit_goal = st.form_submit_button("Save goals")
+    if submit_goal:
+        goal_payload = {
+            "target_calories": target_cal,
+            "target_protein": target_protein,
+            "target_steps": target_steps,
+            "start_date": start_date_input,
+            "end_date": end_date_input if use_end_date else None,
+        }
+        save_user_goal(user_id, goal_payload)
+        st.session_state["goal_config"] = goal_payload
+        current_goal = goal_payload
+        st.success(f"Goals saved for {user_id}")
+
+st.caption(
+    f"Active goal window: {current_goal.get('start_date')} to "
+    f"{current_goal.get('end_date') or 'open'} | "
+    f"{current_goal.get('target_calories')} kcal, "
+    f"{current_goal.get('target_protein')} g protein, "
+    f"{current_goal.get('target_steps')} steps per day."
+)
 
 # ----------------------- Hevy ----------------------------
 st.header("Hevy Connection")
@@ -388,7 +580,9 @@ else:
             hevy_sets_df=hevy_sets_df,
         )
 
-        # store for Tier-1 analytics
+        if current_goal:
+            daily_df = apply_goal_columns(daily_df, current_goal)
+
         st.session_state["daily_df"] = daily_df
 
         st.dataframe(daily_df)
@@ -398,9 +592,7 @@ else:
             {
                 "nutrition_rows": 0 if nutrition_df is None else len(nutrition_df),
                 "garmin_daily_rows": 0 if garmin_daily_df is None else len(garmin_daily_df),
-                "garmin_activities_rows": 0
-                if garmin_activities_df is None
-                else len(garmin_activities_df),
+                "garmin_activities_rows": 0 if garmin_activities_df is None else len(garmin_activities_df),
                 "hevy_sets_rows": 0 if hevy_sets_df is None else len(hevy_sets_df),
                 "daily_rows": len(daily_df),
             }
@@ -412,7 +604,6 @@ else:
 # =========================================================
 #              TIER-1 ANALYTICS SECTION
 # =========================================================
-# ====================== Tier-1 analytics =====================
 st.header("Tier-1 analytics")
 
 daily_df = st.session_state.get("daily_df")
@@ -420,11 +611,13 @@ daily_df = st.session_state.get("daily_df")
 if daily_df is None or daily_df.empty:
     st.info("Generate the unified daily dataset first to see analytics.")
 else:
-    # Work on a copy and normalize date dtype
     df = daily_df.copy()
     df["date"] = pd.to_datetime(df["date"])
 
-    # Convenience series with NaN handled
+    goal_cfg = st.session_state.get("goal_config")
+    if goal_cfg:
+        df = apply_goal_columns(df, goal_cfg)
+
     calories = df.get("calories_kcal", pd.Series(dtype=float)).fillna(0.0)
     g_calories = df.get("garmin_calories_kcal", pd.Series(dtype=float)).fillna(0.0)
     protein = df.get("protein_g", pd.Series(dtype=float)).fillna(0.0)
@@ -432,7 +625,6 @@ else:
     fat = df.get("fat_g", pd.Series(dtype=float)).fillna(0.0)
     steps = df.get("garmin_steps", pd.Series(dtype=float)).fillna(0.0)
 
-    # 1 - KPI snapshot
     st.subheader("KPI snapshot")
 
     total_days = len(df)
@@ -451,44 +643,46 @@ else:
     with c4:
         st.metric("Avg steps per day", f"{avg_steps:,.0f}")
 
-    # 2 - Weekly summaries
     st.subheader("Weekly summaries")
 
-    weekly = (
-        df.set_index("date")
-        .resample("W-MON")  # weeks ending on Monday (so week label is Monday)
-        .agg(
+    weekly = compute_weekly_with_goals(df)
+    if weekly.empty:
+        st.info("Weekly summaries will appear once you have logged data.")
+    else:
+        weekly_view = weekly[
+            [
+                "week",
+                "avg_kcal",
+                "avg_protein",
+                "avg_steps",
+                "goal_kcal_delta",
+                "goal_calorie_compliance",
+                "goal_protein_compliance",
+                "goal_steps_compliance",
+            ]
+        ].copy()
+        weekly_view = weekly_view.round(
             {
-                "calories_kcal": "mean",
-                "protein_g": "mean",
-                "carbs_g": "mean",
-                "fat_g": "mean",
-                "garmin_calories_kcal": "mean",
-                "garmin_steps": "mean",
+                "avg_kcal": 1,
+                "avg_protein": 1,
+                "avg_steps": 1,
+                "goal_kcal_delta": 1,
+                "goal_calorie_compliance": 2,
+                "goal_protein_compliance": 2,
+                "goal_steps_compliance": 2,
             }
         )
-        .rename(
+        weekly_view.rename(
             columns={
-                "calories_kcal": "avg_kcal",
-                "protein_g": "avg_protein",
-                "carbs_g": "avg_carbs",
-                "fat_g": "avg_fat",
-                "garmin_calories_kcal": "avg_garmin_kcal",
-                "garmin_steps": "avg_steps",
-            }
+                "goal_kcal_delta": "kcal delta vs goal",
+                "goal_calorie_compliance": "calorie goal hit rate",
+                "goal_protein_compliance": "protein goal hit rate",
+                "goal_steps_compliance": "steps goal hit rate",
+            },
+            inplace=True,
         )
-        .reset_index()
-    )
+        st.dataframe(weekly_view, use_container_width=True)
 
-    # Make week label nice
-    weekly["week"] = weekly["date"].dt.strftime("%Y-W%U")
-    weekly_view = weekly[
-        ["week", "avg_kcal", "avg_protein", "avg_carbs", "avg_fat", "avg_steps"]
-    ].round(1)
-
-    st.dataframe(weekly_view, use_container_width=True)
-
-    # 3 - Time series charts
     st.subheader("Trends")
 
     chart_cols = st.columns(2)
@@ -511,25 +705,17 @@ else:
         macro_df = macro_df.set_index("date")
         st.line_chart(macro_df)
 
-    # 4 - Basic correlations
     st.subheader("Basic correlations")
 
     corr_rows = []
 
     if len(calories[calories > 0]) >= 3 and len(steps[steps > 0]) >= 3:
         corr_steps_kcal = calories.corr(steps)
-        corr_rows.append(
-            {"pair": "Calories vs steps", "correlation": corr_steps_kcal}
-        )
+        corr_rows.append({"pair": "Calories vs steps", "correlation": corr_steps_kcal})
 
     if len(calories[calories > 0]) >= 3 and len(g_calories[g_calories > 0]) >= 3:
         corr_intake_vs_garmin = calories.corr(g_calories)
-        corr_rows.append(
-            {"pair": "Intake kcal vs Garmin kcal", "correlation": corr_intake_vs_garmin}
-        )
-
-    # Optional - if you later add training volume columns from Hevy,
-    # you can extend correlations here, guarded by column checks.
+        corr_rows.append({"pair": "Intake kcal vs Garmin kcal", "correlation": corr_intake_vs_garmin})
 
     if corr_rows:
         corr_df = pd.DataFrame(corr_rows)
@@ -538,26 +724,18 @@ else:
     else:
         st.info("Not enough overlapping data to compute correlations yet.")
 
-    # 5 - Best and worst days
     st.subheader("Best and worst days")
 
     if (calories > 0).any():
         best_kcal_day = df.loc[calories.idxmin(), "date"].date()
         worst_kcal_day = df.loc[calories.idxmax(), "date"].date()
-        st.write(
-            f"- Lowest calorie day: **{best_kcal_day}** with {calories.min():.0f} kcal"
-        )
-        st.write(
-            f"- Highest calorie day: **{worst_kcal_day}** with {calories.max():.0f} kcal"
-        )
+        st.write(f"- Lowest calorie day: {best_kcal_day} with {calories.min():.0f} kcal")
+        st.write(f"- Highest calorie day: {worst_kcal_day} with {calories.max():.0f} kcal")
 
     if (steps > 0).any():
         best_steps_day = df.loc[steps.idxmax(), "date"].date()
-        st.write(
-            f"- Highest steps day: **{best_steps_day}** with {steps.max():,.0f} steps"
-        )
+        st.write(f"- Highest steps day: {best_steps_day} with {steps.max():,.0f} steps")
 
-    # 6 - Debug helper
     with st.expander("Debug: available daily_df columns"):
         st.write(list(df.columns))
 
@@ -574,109 +752,130 @@ else:
     df["date"] = pd.to_datetime(df["date"])
     df = df.sort_values("date")
 
-    # Extract useful series
+    goal_cfg = st.session_state.get("goal_config")
+    if goal_cfg:
+        df = apply_goal_columns(df, goal_cfg)
+
     kcal_in = df["calories_kcal"].fillna(0)
     kcal_out = df["garmin_calories_kcal"].fillna(0)
     protein = df["protein_g"].fillna(0)
     steps = df["garmin_steps"].fillna(0)
 
-    # Rolling windows
     last7 = df.tail(7)
     last14 = df.tail(14)
 
-    # -----------------------------
-    # HIGH-LEVEL INSIGHTS FEED
-    # -----------------------------
+    avg_in_last7 = last7["calories_kcal"].mean() if not last7.empty else 0
+    avg_steps_last7 = last7["garmin_steps"].mean() if not last7.empty else 0
+
     st.subheader("Insights Feed")
 
     insights = []
 
-    # 1. Energy balance trend
+    if "goal_active" in df.columns and df["goal_active"].any():
+        recent_goal_days = last7[last7["goal_active"]]
+        if not recent_goal_days.empty:
+            cal_comp = recent_goal_days["goal_calorie_met"].mean()
+            cal_delta = recent_goal_days["goal_calorie_delta"].mean()
+            cur_streak, long_streak = streak_lengths(recent_goal_days["goal_calorie_met"])
+            insights.append(
+                f"Calorie goal met {cal_comp * 100:.0f}% of the last {len(recent_goal_days)} goal days "
+                f"({cal_delta:+.0f} kcal average vs target). Longest recent streak: {long_streak} days."
+            )
+            deficit_streak, _ = streak_lengths(recent_goal_days["goal_calorie_delta"] < -150)
+            surplus_streak, _ = streak_lengths(recent_goal_days["goal_calorie_delta"] > 150)
+            if deficit_streak >= 3:
+                insights.append("Running deficit streak against your calorie goal (3+ days).")
+            if surplus_streak >= 3:
+                insights.append("Running surplus streak against your calorie goal (3+ days).")
+
+        if "goal_protein_met" in df.columns and not last7.empty:
+            protein_comp = last7[last7["goal_active"]]["goal_protein_met"].mean()
+            insights.append(f"Protein goal hit rate: {protein_comp * 100:.0f}% of goal-active days in the last week.")
+
+        if "goal_steps_met" in df.columns and not last7.empty:
+            steps_comp = last7[last7["goal_active"]]["goal_steps_met"].mean()
+            insights.append(f"Steps goal hit rate: {steps_comp * 100:.0f}% of goal-active days in the last week.")
+
     if (last7["calories_kcal"] > 0).sum() >= 3:
-        avg_in = last7["calories_kcal"].mean()
         avg_out = last7["garmin_calories_kcal"].mean() if (last7["garmin_calories_kcal"] > 0).any() else None
-
         if avg_out:
-            net = avg_in - avg_out
+            net = avg_in_last7 - avg_out
             if net < -200:
-                insights.append(f"You're in a consistent **weekly deficit** (~{abs(net):.0f} kcal/day). Suitable for fat loss.")
+                insights.append(f"Consistent weekly deficit (~{abs(net):.0f} kcal/day).")
             elif net > 200:
-                insights.append(f"You're in a **weekly surplus** (~{net:.0f} kcal/day). Suitable for muscle gain.")
+                insights.append(f"Consistent weekly surplus (~{net:.0f} kcal/day).")
             else:
-                insights.append("Your weekly energy balance is **near maintenance**.")
+                insights.append("Weekly energy balance is near maintenance.")
 
-    # 2. Protein compliance
-    if (last7["protein_g"] > 0).any():
-        p_mean = last7["protein_g"].mean()
-        days_high_protein = (last7["protein_g"] >= 130).sum()  # example threshold
-        insights.append(
-            f"Protein intake averages **{p_mean:.0f} g/day**, with {days_high_protein}/7 days above target."
-        )
-
-    # 3. Steps trend
     if (last7["garmin_steps"] > 0).any():
-        steps_mean = last7["garmin_steps"].mean()
         prev7 = df.tail(14).head(7)
         if (prev7["garmin_steps"] > 0).any():
-            delta = steps_mean - prev7["garmin_steps"].mean()
+            delta = avg_steps_last7 - prev7["garmin_steps"].mean()
             if delta > 1000:
-                insights.append("Your daily steps are **trending upward** compared to last week.")
+                insights.append("Daily steps are trending upward compared to the prior week.")
             elif delta < -1000:
-                insights.append("Your daily steps are **trending downward** compared to last week.")
+                insights.append("Daily steps are trending downward compared to the prior week.")
             else:
                 insights.append("Steps are stable week-over-week.")
 
-    # 4. High-burn days and fueling mismatch
     if (kcal_out > 0).any():
         heavy_days = df[df["garmin_calories_kcal"] > 600]
         if not heavy_days.empty:
-            # look for underfed days among them
             underfed = heavy_days[heavy_days["calories_kcal"] < heavy_days["garmin_calories_kcal"] - 300]
             if not underfed.empty:
                 d = underfed.iloc[-1]["date"].date()
                 insights.append(
-                    f"On **{d}**, you had a high-burn day with **insufficient fueling**. Consider increasing carbs on such days."
+                    f"On {d}, high burn with low intake. Consider increasing carbs on demanding days."
                 )
 
-    # 5. Weekend pattern detection
     weekend = df[df["date"].dt.weekday >= 5]
     if not weekend.empty:
         w_kcal = weekend["calories_kcal"].mean()
         wd_kcal = df[df["date"].dt.weekday < 5]["calories_kcal"].mean()
         if w_kcal < wd_kcal - 200:
-            insights.append("You tend to **undereat on weekends** compared to weekdays.")
+            insights.append("You undereat on weekends compared to weekdays.")
         elif w_kcal > wd_kcal + 200:
-            insights.append("You tend to **overeat on weekends** compared to weekdays.")
+            insights.append("You overeat on weekends compared to weekdays.")
 
-    # Display insights
     if not insights:
         st.info("No significant patterns detected yet.")
     else:
         for insight in insights:
-            st.markdown(f"• {insight}")
+            st.markdown(f"- {insight}")
 
-    # -----------------------------
-    # FLAGS (Red / Amber / Green)
-    # -----------------------------
     st.subheader("Health & Performance Flags")
 
     flags = []
 
-    # Red flags
-    if avg_in < 1400:
-        flags.append(("red", "Daily intake very low — risk of under-fueling."))
-    if protein.mean() < 90:
-        flags.append(("red", "Protein intake consistently low — prioritize protein-rich meals."))
+    if "goal_active" in df.columns and df["goal_active"].any():
+        goal_days = last7[last7["goal_active"]]
+        cal_comp = goal_days["goal_calorie_met"].mean() if not goal_days.empty else 0
+        prot_comp = goal_days["goal_protein_met"].mean() if not goal_days.empty else 0
+        steps_comp = goal_days["goal_steps_met"].mean() if not goal_days.empty else 0
 
-    # Amber flags
-    if steps_mean < 6000:
-        flags.append(("amber", "Low activity trend — steps have been below 6000 on average."))
+        if cal_comp < 0.35:
+            flags.append(("red", "Calorie goal rarely met over the last week."))
+        elif cal_comp < 0.6:
+            flags.append(("amber", "Calorie goal compliance is moderate."))
 
-    # Green flags
-    if avg_in > 1800 and protein.mean() > 120:
-        flags.append(("green", "Nutrition profile supports strength and recovery."))
+        if prot_comp < 0.4:
+            flags.append(("amber", "Protein goal often missed."))
 
-    # Render flags
+        if steps_comp < 0.5:
+            flags.append(("amber", "Steps goal often missed."))
+
+        if cal_comp >= 0.7 and prot_comp >= 0.7 and steps_comp >= 0.7:
+            flags.append(("green", "Strong compliance across calorie, protein, and steps goals."))
+    else:
+        if avg_in_last7 < 1400:
+            flags.append(("red", "Daily intake very low; risk of under-fueling."))
+        if protein.mean() < 90:
+            flags.append(("red", "Protein intake consistently low; prioritize protein-rich meals."))
+        if avg_steps_last7 < 6000:
+            flags.append(("amber", "Low activity trend; steps below 6000 on average."))
+        if avg_in_last7 > 1800 and protein.mean() > 120:
+            flags.append(("green", "Nutrition profile supports strength and recovery."))
+
     for level, msg in flags:
         if level == "red":
             st.error(msg)
@@ -685,28 +884,30 @@ else:
         elif level == "green":
             st.success(msg)
 
-    # -----------------------------
-    # Special patterns
-    # -----------------------------
     st.subheader("Patterns Detected")
 
     patterns = []
 
-    # Low protein streak
+    if "goal_calorie_delta" in df.columns:
+        surplus_run = streak_lengths(df["goal_calorie_delta"] > 200)[0]
+        deficit_run = streak_lengths(df["goal_calorie_delta"] < -200)[0]
+        if surplus_run >= 3:
+            patterns.append("Calorie surplus streak detected (3+ days above goal).")
+        if deficit_run >= 3:
+            patterns.append("Calorie deficit streak detected (3+ days below goal).")
+
     lowp = (df["protein_g"] < 100).rolling(3).sum()
     if (lowp == 3).any():
-        patterns.append("3-day **low protein streak** detected.")
+        patterns.append("3-day low protein streak detected.")
 
-    # Calorie under-reporting days
     if (df["calories_kcal"] == 0).sum() >= 2:
-        patterns.append("Several days with **no nutrition logged** — insights may be incomplete.")
+        patterns.append("Several days with no nutrition logged; insights may be incomplete.")
 
-    # Steps inconsistency
     if df["garmin_steps"].std() > 5000:
-        patterns.append("High variability in step count — inconsistent daily movement.")
+        patterns.append("High variability in step count; daily movement inconsistent.")
 
     if not patterns:
         st.info("No notable patterns this week.")
     else:
         for p in patterns:
-            st.write(f"• {p}")
+            st.write(f"- {p}")
