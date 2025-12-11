@@ -177,6 +177,71 @@ def streak_lengths(series: pd.Series) -> tuple[int, int]:
     return current, longest
 
 
+def rolling_delta(series: pd.Series, window: int = 7) -> tuple[float, float] | None:
+    """
+    Compare the latest window average vs the previous window average.
+    Returns (delta, pct_change) if we have enough data, otherwise None.
+    """
+    clean = series.dropna()
+    if len(clean) < window * 2:
+        return None
+    recent = clean.tail(window).mean()
+    prev = clean.tail(window * 2).head(window).mean()
+    if pd.isna(prev) or prev == 0:
+        pct = 0.0
+    else:
+        pct = (recent - prev) / prev
+    return recent - prev, pct
+
+
+def build_text_pdf(title: str, body_lines: list[str]) -> bytes:
+    """Minimal single-page PDF generator for tabular summaries without extra deps."""
+    def escape(text: str) -> str:
+        return text.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+
+    lines = [title, ""] + body_lines
+    y = 770
+    chunks = []
+    for line in lines:
+        safe = escape(line)
+        chunks.append(f"BT /F1 12 Tf 40 {y} Td ({safe}) Tj ET")
+        y -= 16
+        if y <= 40:
+            break  # keep it single-page
+
+    stream = "\n".join(chunks)
+    stream_bytes = stream.encode("latin-1", errors="replace")
+
+    objects = []
+    objects.append(b"1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj")
+    objects.append(b"2 0 obj << /Type /Pages /Count 1 /Kids [3 0 R] >> endobj")
+    objects.append(
+        b"3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+        b"/Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >> endobj"
+    )
+    objects.append(
+        f"4 0 obj << /Length {len(stream_bytes)} >> stream\n".encode("latin-1")
+        + stream_bytes
+        + b"\nendstream endobj"
+    )
+    objects.append(b"5 0 obj << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> endobj")
+
+    pdf = b"%PDF-1.4\n"
+    offsets = []
+    for obj in objects:
+        offsets.append(len(pdf))
+        pdf += obj + b"\n"
+
+    xref_pos = len(pdf)
+    pdf += f"xref\n0 {len(objects) + 1}\n".encode("latin-1")
+    pdf += b"0000000000 65535 f \n"
+    for off in offsets:
+        pdf += f"{off:010d} 00000 n \n".encode("latin-1")
+    pdf += b"trailer\n<< /Size " + str(len(objects) + 1).encode("latin-1") + b" /Root 1 0 R >>\n"
+    pdf += b"startxref\n" + str(xref_pos).encode("latin-1") + b"\n%%EOF"
+    return pdf
+
+
 # =========================================================
 # Helper utilities
 # =========================================================
@@ -497,6 +562,47 @@ st.caption(
     f"{current_goal.get('target_steps')} steps per day."
 )
 
+# ----------------------- Personalization ----------------------------
+st.subheader("Personalization (used for training load guidance)")
+
+c_body, c_rpe = st.columns(2)
+
+with c_body:
+    body_weight = st.number_input(
+        "Body weight (kg)",
+        min_value=30.0,
+        max_value=250.0,
+        value=float(st.session_state.get("body_weight", 75.0)),
+        step=0.5,
+    )
+    st.session_state["body_weight"] = body_weight
+
+with c_rpe:
+    rpe_raw_default = st.session_state.get("rpe_log_raw", "7,8,7")
+    rpe_raw = st.text_input(
+        "Recent session RPEs (comma separated)",
+        value=rpe_raw_default,
+        help="Add your last few lifting sessions (e.g. 7,7.5,8,8.5)",
+    )
+    st.session_state["rpe_log_raw"] = rpe_raw
+
+def _parse_rpe(raw: str) -> list[float]:
+    vals = []
+    for chunk in str(raw).split(","):
+        try:
+            vals.append(float(chunk.strip()))
+        except Exception:
+            continue
+    return [v for v in vals if 0 <= v <= 10]
+
+rpe_log = _parse_rpe(rpe_raw)
+st.session_state["rpe_log"] = rpe_log
+
+if rpe_log:
+    st.caption(f"RPE entries saved: {len(rpe_log)} | Avg RPE: {sum(rpe_log)/len(rpe_log):.1f}")
+else:
+    st.caption("No RPE entries yet. Add a few to tailor recovery guidance.")
+
 # ----------------------- Hevy ----------------------------
 st.header("Hevy Connection")
 
@@ -683,6 +789,23 @@ else:
         )
         st.dataframe(weekly_view, use_container_width=True)
 
+        csv_bytes = weekly_view.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "Download weekly summary (CSV)",
+            data=csv_bytes,
+            file_name="weekly_summary.csv",
+            mime="text/csv",
+        )
+
+        text_table = weekly_view.to_string(index=False).splitlines()
+        pdf_bytes = build_text_pdf("Weekly summary", text_table)
+        st.download_button(
+            "Download weekly summary (PDF)",
+            data=pdf_bytes,
+            file_name="weekly_summary.pdf",
+            mime="application/pdf",
+        )
+
     st.subheader("Trends")
 
     chart_cols = st.columns(2)
@@ -760,12 +883,18 @@ else:
     kcal_out = df["garmin_calories_kcal"].fillna(0)
     protein = df["protein_g"].fillna(0)
     steps = df["garmin_steps"].fillna(0)
+    volume = df["hevy_volume_kg"].fillna(0) if "hevy_volume_kg" in df.columns else pd.Series(dtype=float)
 
     last7 = df.tail(7)
     last14 = df.tail(14)
 
     avg_in_last7 = last7["calories_kcal"].mean() if not last7.empty else 0
     avg_steps_last7 = last7["garmin_steps"].mean() if not last7.empty else 0
+    avg_volume_last7 = last7["hevy_volume_kg"].mean() if "hevy_volume_kg" in last7.columns else 0
+
+    body_weight = st.session_state.get("body_weight")
+    rpe_log = st.session_state.get("rpe_log", [])
+    avg_rpe = sum(rpe_log) / len(rpe_log) if rpe_log else None
 
     st.subheader("Insights Feed")
 
@@ -795,6 +924,54 @@ else:
         if "goal_steps_met" in df.columns and not last7.empty:
             steps_comp = last7[last7["goal_active"]]["goal_steps_met"].mean()
             insights.append(f"Steps goal hit rate: {steps_comp * 100:.0f}% of goal-active days in the last week.")
+
+    kcal_trend = rolling_delta(kcal_in, window=7)
+    steps_trend = rolling_delta(steps, window=7)
+    vol_trend = rolling_delta(volume, window=7) if not volume.empty else None
+
+    def _trend_text(label: str, trend: tuple[float, float] | None, unit: str) -> str | None:
+        if not trend:
+            return None
+        delta, pct = trend
+        if abs(delta) < (1 if unit == "kg" else 50):
+            direction = "stable"
+        elif delta > 0:
+            direction = "rising"
+        else:
+            direction = "falling"
+        return f"{label} {direction} ({delta:+.0f} {unit} vs prior week, {pct * 100:+.0f}%)."
+
+    for text in [
+        _trend_text("Calorie intake", kcal_trend, "kcal"),
+        _trend_text("Steps", steps_trend, "steps"),
+        _trend_text("Training volume", vol_trend, "kg"),
+    ]:
+        if text:
+            insights.append(text)
+
+    if kcal_trend and steps_trend:
+        if kcal_trend[0] > 100 and steps_trend[0] < -500:
+            insights.append("Energy intake is creeping up while steps are dropping; watch balance.")
+        elif kcal_trend[0] < -100 and steps_trend[0] > 500:
+            insights.append("You are eating less while moving more—ensure recovery and protein are solid.")
+
+    if vol_trend and abs(vol_trend[0]) > 200:
+        if avg_rpe and avg_rpe >= 8:
+            insights.append(
+                f"Volume change ({vol_trend[0]:+.0f} kg) paired with high RPE ({avg_rpe:.1f}); consider a deload or extra rest."
+            )
+        elif body_weight and body_weight > 0:
+            rel_load = (last7["hevy_volume_kg"].sum() if "hevy_volume_kg" in last7.columns else 0) / body_weight
+            if rel_load > 150:
+                insights.append(
+                    f"High relative load this week (~{rel_load:.0f} kg per kg bodyweight). Keep sleep and fueling tight."
+                )
+
+    if avg_rpe is not None:
+        if avg_rpe >= 8.5:
+            insights.append("RPE trend is high; prioritize recovery days and lighter accessories.")
+        elif avg_rpe <= 6 and avg_volume_last7 > 0 and (vol_trend and vol_trend[0] <= 0):
+            insights.append("RPE is comfortable and volume is flat/down—could add a small progression next week.")
 
     if (last7["calories_kcal"] > 0).sum() >= 3:
         avg_out = last7["garmin_calories_kcal"].mean() if (last7["garmin_calories_kcal"] > 0).any() else None
@@ -875,6 +1052,13 @@ else:
             flags.append(("amber", "Low activity trend; steps below 6000 on average."))
         if avg_in_last7 > 1800 and protein.mean() > 120:
             flags.append(("green", "Nutrition profile supports strength and recovery."))
+
+    if avg_rpe and avg_rpe >= 8.5:
+        flags.append(("amber", f"Average RPE is high ({avg_rpe:.1f}); watch fatigue and sleep."))
+    if body_weight and body_weight > 0 and avg_volume_last7 > 0:
+        rel_weekly = (last7["hevy_volume_kg"].sum() if "hevy_volume_kg" in last7.columns else 0) / body_weight
+        if rel_weekly > 180:
+            flags.append(("amber", f"Heavy relative lifting load this week (~{rel_weekly:.0f} kg/kg bodyweight)."))
 
     for level, msg in flags:
         if level == "red":
