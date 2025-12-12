@@ -34,6 +34,21 @@ COLS = {
 # Where we persist per-user goals locally
 GOAL_STORE_PATH = Path("user_goals.json")
 
+FEATURE_FLAGS = {
+    "tier1_dashboard": True,
+    "tier2_insights": True,
+}
+
+# Default categories for KPI/insight cards
+CARD_CATEGORIES = ["Goals", "Energy", "Nutrition", "Training", "Recovery", "Habits", "Activity"]
+
+
+def _default_category_order(selected: list[str] | None = None) -> list[str]:
+    base = CARD_CATEGORIES.copy()
+    if not selected:
+        return base
+    return [c for c in base if c in selected] + [c for c in selected if c not in base]
+
 
 # =========================================================
 # Goal helpers
@@ -163,6 +178,42 @@ def compute_weekly_with_goals(df: pd.DataFrame) -> pd.DataFrame:
     agg = agg.reset_index().sort_values("week_start")
     agg["week"] = agg["week_start"].dt.strftime("%Y-%m-%d")
     return agg
+
+
+@st.cache_data(show_spinner=False)
+def slice_time_window(df: pd.DataFrame, days: int) -> pd.DataFrame:
+    """
+    Return the last N days of data (inclusive) based on the 'date' column.
+    """
+    if df is None or df.empty or "date" not in df.columns:
+        return pd.DataFrame()
+    data = df.copy()
+    data["date"] = pd.to_datetime(data["date"])
+    end_date = data["date"].max()
+    start_date = end_date - pd.to_timedelta(days - 1, unit="D")
+    return data[data["date"].between(start_date, end_date)].copy()
+
+
+def format_delta_text(delta: float | None, unit: str = "") -> str | None:
+    if delta is None:
+        return None
+    sign = "+" if delta > 0 else ""
+    suffix = f" {unit}" if unit else ""
+    return f"{sign}{delta:.0f}{suffix}"
+
+
+def compute_category_order(selected_categories: list[str]) -> list[str]:
+    order_cfg = st.session_state.get("category_order", {})
+    if not selected_categories:
+        return []
+    ordered = []
+    for cat, idx in sorted(order_cfg.items(), key=lambda x: x[1]):
+        if cat in selected_categories:
+            ordered.append(cat)
+    for cat in selected_categories:
+        if cat not in ordered:
+            ordered.append(cat)
+    return ordered
 
 
 def streak_lengths(series: pd.Series) -> tuple[int, int]:
@@ -714,7 +765,9 @@ st.header("Tier-1 analytics")
 
 daily_df = st.session_state.get("daily_df")
 
-if daily_df is None or daily_df.empty:
+if not FEATURE_FLAGS["tier1_dashboard"]:
+    st.info("Tier-1 dashboard is disabled by configuration.")
+elif daily_df is None or daily_df.empty:
     st.info("Generate the unified daily dataset first to see analytics.")
 else:
     df = daily_df.copy()
@@ -724,123 +777,229 @@ else:
     if goal_cfg:
         df = apply_goal_columns(df, goal_cfg)
 
-    calories = df.get("calories_kcal", pd.Series(dtype=float)).fillna(0.0)
-    g_calories = df.get("garmin_calories_kcal", pd.Series(dtype=float)).fillna(0.0)
-    protein = df.get("protein_g", pd.Series(dtype=float)).fillna(0.0)
-    carbs = df.get("carbs_g", pd.Series(dtype=float)).fillna(0.0)
-    fat = df.get("fat_g", pd.Series(dtype=float)).fillna(0.0)
-    steps = df.get("garmin_steps", pd.Series(dtype=float)).fillna(0.0)
+    # ----------------------- Controls ----------------------------
+    with st.expander("Dashboard controls"):
+        window_days = st.selectbox("Time window (days)", [7, 14, 28], index=0, help="Applies to KPI cards, trends, and insights.")
+        selected_categories = st.multiselect(
+            "Categories to show",
+            CARD_CATEGORIES,
+            default=st.session_state.get("selected_categories", CARD_CATEGORIES),
+        )
+        st.session_state["selected_categories"] = selected_categories
+        st.session_state["window_days"] = window_days
 
-    st.subheader("KPI snapshot")
+        st.caption("Set ordering (1 = first). Leave blank to keep defaults.")
+        order_inputs = {}
+        for cat in selected_categories:
+            order_inputs[cat] = st.number_input(f"{cat} order", min_value=1, max_value=len(selected_categories), value=st.session_state.get("category_order", {}).get(cat, _default_category_order(selected_categories).index(cat) + 1))
+        st.session_state["category_order"] = order_inputs
 
-    total_days = len(df)
-    tracked_days = int((calories > 0).sum())
-    avg_kcal = calories[calories > 0].mean() if (calories > 0).any() else 0
-    avg_protein = protein[protein > 0].mean() if (protein > 0).any() else 0
-    avg_steps = steps[steps > 0].mean() if (steps > 0).any() else 0
-
-    c1, c2, c3, c4 = st.columns(4)
-    with c1:
-        st.metric("Tracked nutrition days", f"{tracked_days} / {total_days}")
-    with c2:
-        st.metric("Avg intake (kcal)", f"{avg_kcal:,.0f}")
-    with c3:
-        st.metric("Avg protein (g)", f"{avg_protein:,.0f}")
-    with c4:
-        st.metric("Avg steps per day", f"{avg_steps:,.0f}")
-
-    st.subheader("Weekly summaries")
-
-    weekly = compute_weekly_with_goals(df)
-    if weekly.empty:
-        st.info("Weekly summaries will appear once you have logged data.")
+    scoped = slice_time_window(df, window_days)
+    if scoped.empty:
+        st.info("No data in the selected window yet.")
     else:
-        weekly_view = weekly[
-            [
-                "week",
-                "avg_kcal",
-                "avg_protein",
-                "avg_steps",
-                "goal_kcal_delta",
-                "goal_calorie_compliance",
-                "goal_protein_compliance",
-                "goal_steps_compliance",
-            ]
-        ].copy()
-        weekly_view = weekly_view.round(
+        previous_scope = df[df["date"] < scoped["date"].min()].tail(window_days)
+
+        calories = scoped.get("calories_kcal", pd.Series(dtype=float)).fillna(0.0)
+        g_calories = scoped.get("garmin_calories_kcal", pd.Series(dtype=float)).fillna(0.0)
+        protein = scoped.get("protein_g", pd.Series(dtype=float)).fillna(0.0)
+        carbs = scoped.get("carbs_g", pd.Series(dtype=float)).fillna(0.0)
+        fat = scoped.get("fat_g", pd.Series(dtype=float)).fillna(0.0)
+
+        st.subheader("KPI cards")
+
+        cards: list[dict] = []
+        total_days = len(scoped)
+        tracked_days = int((calories > 0).sum())
+        avg_kcal = calories[calories > 0].mean() if (calories > 0).any() else 0
+        avg_protein = protein[protein > 0].mean() if (protein > 0).any() else 0
+
+        prev_kcal = previous_scope["calories_kcal"].mean() if not previous_scope.empty and "calories_kcal" in previous_scope.columns else None
+        prev_protein = previous_scope["protein_g"].mean() if not previous_scope.empty and "protein_g" in previous_scope.columns else None
+
+        cards.append(
             {
-                "avg_kcal": 1,
-                "avg_protein": 1,
-                "avg_steps": 1,
-                "goal_kcal_delta": 1,
-                "goal_calorie_compliance": 2,
-                "goal_protein_compliance": 2,
-                "goal_steps_compliance": 2,
+                "category": "Goals",
+                "title": "Tracked nutrition days",
+                "value": f"{tracked_days}/{total_days}",
+                "delta": None,
+                "description": "Days with logged calories in window",
             }
         )
-        weekly_view.rename(
-            columns={
-                "goal_kcal_delta": "kcal delta vs goal",
-                "goal_calorie_compliance": "calorie goal hit rate",
-                "goal_protein_compliance": "protein goal hit rate",
-                "goal_steps_compliance": "steps goal hit rate",
-            },
-            inplace=True,
+        if goal_cfg and "goal_calorie_met" in scoped.columns:
+            goal_days = scoped[scoped["goal_active"]]
+            goal_rate = goal_days["goal_calorie_met"].mean() if not goal_days.empty else 0
+            cards.append(
+                {
+                    "category": "Goals",
+                    "title": "Calorie goal hit rate",
+                    "value": f"{goal_rate * 100:.0f}%",
+                    "delta": format_delta_text(goal_days["goal_calorie_delta"].mean(), "kcal vs goal") if "goal_calorie_delta" in goal_days.columns else None,
+                    "description": "Share of goal-active days meeting target",
+                }
+            )
+
+        cards.append(
+            {
+                "category": "Energy",
+                "title": "Avg intake",
+                "value": f"{avg_kcal:,.0f} kcal",
+                "delta": format_delta_text(avg_kcal - prev_kcal, "vs prior window") if prev_kcal else None,
+                "description": "Average calories in selected window",
+            }
         )
-        st.dataframe(weekly_view, use_container_width=True)
+        if "garmin_calories_kcal" in scoped.columns and (g_calories > 0).any():
+            avg_out = g_calories[g_calories > 0].mean()
+            cards.append(
+                {
+                    "category": "Energy",
+                    "title": "Avg burn (Garmin)",
+                    "value": f"{avg_out:,.0f} kcal",
+                    "delta": None,
+                    "description": "Average calories out per day",
+                }
+            )
+            cards.append(
+                {
+                    "category": "Energy",
+                    "title": "Net balance",
+                    "value": f"{(avg_kcal - avg_out):+.0f} kcal",
+                    "delta": None,
+                    "description": "Intake minus burn (avg/day)",
+                }
+            )
 
-        csv_bytes = weekly_view.to_csv(index=False).encode("utf-8")
-        st.download_button(
-            "Download weekly summary (CSV)",
-            data=csv_bytes,
-            file_name="weekly_summary.csv",
-            mime="text/csv",
+        cards.append(
+            {
+                "category": "Nutrition",
+                "title": "Avg protein",
+                "value": f"{avg_protein:,.0f} g",
+                "delta": format_delta_text(avg_protein - prev_protein, "g vs prior window") if prev_protein else None,
+                "description": "Protein grams per day",
+            }
         )
+        if (carbs > 0).any():
+            cards.append(
+                {
+                    "category": "Nutrition",
+                    "title": "Avg carbs",
+                    "value": f"{carbs[carbs > 0].mean():,.0f} g",
+                    "delta": None,
+                    "description": None,
+                }
+            )
+        if (fat > 0).any():
+            cards.append(
+                {
+                    "category": "Nutrition",
+                    "title": "Avg fat",
+                    "value": f"{fat[fat > 0].mean():,.0f} g",
+                    "delta": None,
+                    "description": None,
+                }
+            )
 
-        text_table = weekly_view.to_string(index=False).splitlines()
-        pdf_bytes = build_text_pdf("Weekly summary", text_table)
-        st.download_button(
-            "Download weekly summary (PDF)",
-            data=pdf_bytes,
-            file_name="weekly_summary.pdf",
-            mime="application/pdf",
-        )
+        if "garmin_sleep_hours" in scoped.columns:
+            sleep_avg = scoped["garmin_sleep_hours"].mean()
+            cards.append(
+                {
+                    "category": "Recovery",
+                    "title": "Sleep (avg)",
+                    "value": f"{sleep_avg:.1f} h",
+                    "delta": None,
+                    "description": "Garmin sleep duration",
+                }
+            )
 
-    st.subheader("Trends")
+        ordered_cats = compute_category_order(selected_categories)
+        for cat in ordered_cats:
+            cat_cards = [c for c in cards if c["category"] == cat]
+            if not cat_cards:
+                continue
+            st.markdown(f"**{cat}**")
+            for i in range(0, len(cat_cards), 3):
+                cols = st.columns(min(3, len(cat_cards) - i))
+                for col, card in zip(cols, cat_cards[i : i + 3]):
+                    with col:
+                        st.metric(card["title"], card["value"], delta=card.get("delta"))
+                        if card.get("description"):
+                            st.caption(card["description"])
 
-    chart_cols = st.columns(2)
+        st.subheader(f"Weekly summaries (last {window_days} days)")
 
-    with chart_cols[0]:
-        st.markdown("**Calories over time**")
-        chart_df = df[["date"]].copy()
+        weekly = compute_weekly_with_goals(scoped)
+        if weekly.empty:
+            st.info("Weekly summaries will appear once you have logged data.")
+        else:
+            weekly_view = weekly[
+                [
+                    "week",
+                    "avg_kcal",
+                    "avg_protein",
+                    "avg_steps",
+                    "goal_kcal_delta",
+                    "goal_calorie_compliance",
+                    "goal_protein_compliance",
+                    "goal_steps_compliance",
+                ]
+            ].copy()
+            weekly_view = weekly_view.round(
+                {
+                    "avg_kcal": 1,
+                    "avg_protein": 1,
+                    "avg_steps": 1,
+                    "goal_kcal_delta": 1,
+                    "goal_calorie_compliance": 2,
+                    "goal_protein_compliance": 2,
+                    "goal_steps_compliance": 2,
+                }
+            )
+            weekly_view.rename(
+                columns={
+                    "goal_kcal_delta": "kcal delta vs goal",
+                    "goal_calorie_compliance": "calorie goal hit rate",
+                    "goal_protein_compliance": "protein goal hit rate",
+                    "goal_steps_compliance": "steps goal hit rate",
+                },
+                inplace=True,
+            )
+            st.dataframe(weekly_view, use_container_width=True)
+
+            csv_bytes = weekly_view.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                "Download weekly summary (CSV)",
+                data=csv_bytes,
+                file_name="weekly_summary.csv",
+                mime="text/csv",
+            )
+
+            text_table = weekly_view.to_string(index=False).splitlines()
+            pdf_bytes = build_text_pdf("Weekly summary", text_table)
+            st.download_button(
+                "Download weekly summary (PDF)",
+                data=pdf_bytes,
+                file_name="weekly_summary.pdf",
+                mime="application/pdf",
+            )
+
+        st.subheader("Trends (calories only)")
+
+        chart_df = scoped[["date"]].copy()
         chart_df["intake_kcal"] = calories
         chart_df["garmin_kcal"] = g_calories
         chart_df = chart_df.set_index("date")
         st.line_chart(chart_df)
 
-    with chart_cols[1]:
-        st.markdown("**Macros over time**")
-        macro_df = df[["date"]].copy()
-        macro_df["protein_g"] = protein
-        macro_df["carbs_g"] = carbs
-        macro_df["fat_g"] = fat
-        macro_df = macro_df.set_index("date")
-        st.line_chart(macro_df)
+        st.subheader("Best and worst days")
 
-    st.subheader("Best and worst days")
+        if (calories > 0).any():
+            best_kcal_day = scoped.loc[calories.idxmin(), "date"].date()
+            worst_kcal_day = scoped.loc[calories.idxmax(), "date"].date()
+            st.write(f"- Lowest calorie day: {best_kcal_day} with {calories.min():.0f} kcal")
+            st.write(f"- Highest calorie day: {worst_kcal_day} with {calories.max():.0f} kcal")
 
-    if (calories > 0).any():
-        best_kcal_day = df.loc[calories.idxmin(), "date"].date()
-        worst_kcal_day = df.loc[calories.idxmax(), "date"].date()
-        st.write(f"- Lowest calorie day: {best_kcal_day} with {calories.min():.0f} kcal")
-        st.write(f"- Highest calorie day: {worst_kcal_day} with {calories.max():.0f} kcal")
-
-    if (steps > 0).any():
-        best_steps_day = df.loc[steps.idxmax(), "date"].date()
-        st.write(f"- Highest steps day: {best_steps_day} with {steps.max():,.0f} steps")
-
-    with st.expander("Debug: available daily_df columns"):
-        st.write(list(df.columns))
+        with st.expander("Debug: available daily_df columns"):
+            st.write(list(df.columns))
 
 
 # ====================== Tier-2 Insights (Intelligent Patterns) ======================
@@ -848,7 +1007,9 @@ st.header("Tier-2 Insights")
 
 daily_df = st.session_state.get("daily_df")
 
-if daily_df is None or daily_df.empty:
+if not FEATURE_FLAGS["tier2_insights"]:
+    st.info("Tier-2 insights are disabled by configuration.")
+elif daily_df is None or daily_df.empty:
     st.info("Load the unified daily dataset first to generate insights.")
 else:
     df = daily_df.copy()
@@ -859,252 +1020,262 @@ else:
     if goal_cfg:
         df = apply_goal_columns(df, goal_cfg)
 
-    kcal_in = df["calories_kcal"].fillna(0)
-    kcal_out = df["garmin_calories_kcal"].fillna(0)
-    protein = df["protein_g"].fillna(0)
-    steps = df["garmin_steps"].fillna(0)
-    volume = df["hevy_volume_kg"].fillna(0) if "hevy_volume_kg" in df.columns else pd.Series(dtype=float)
+    window_days = st.session_state.get("window_days", 7)
+    scoped = slice_time_window(df, window_days)
+    previous_scope = df[df["date"] < scoped["date"].min()].tail(window_days) if not scoped.empty else pd.DataFrame()
 
-    last7 = df.tail(7)
-    last14 = df.tail(14)
+    if scoped.empty:
+        st.info("No data available for the selected window.")
+    else:
+        kcal_in = scoped.get("calories_kcal", pd.Series(dtype=float)).fillna(0)
+        kcal_out = scoped.get("garmin_calories_kcal", pd.Series(dtype=float)).fillna(0)
+        protein = scoped.get("protein_g", pd.Series(dtype=float)).fillna(0)
+        steps = scoped.get("garmin_steps", pd.Series(dtype=float)).fillna(0)
+        volume = scoped.get("hevy_volume_kg", pd.Series(dtype=float)).fillna(0)
 
-    avg_in_last7 = last7["calories_kcal"].mean() if not last7.empty else 0
-    avg_steps_last7 = last7["garmin_steps"].mean() if not last7.empty else 0
-    avg_volume_last7 = last7["hevy_volume_kg"].mean() if "hevy_volume_kg" in last7.columns else 0
+        avg_in = kcal_in.mean() if not kcal_in.empty else 0
+        avg_steps = steps.mean() if not steps.empty else 0
+        avg_volume = volume.mean() if not volume.empty else 0
 
-    body_weight = st.session_state.get("body_weight")
-    rpe_log = st.session_state.get("rpe_log", [])
-    avg_rpe = sum(rpe_log) / len(rpe_log) if rpe_log else None
+        prev_in = previous_scope["calories_kcal"].mean() if not previous_scope.empty and "calories_kcal" in previous_scope.columns else None
 
-    st.subheader("Insights Feed")
+        body_weight = st.session_state.get("body_weight")
+        rpe_log = st.session_state.get("rpe_log", [])
+        avg_rpe = sum(rpe_log) / len(rpe_log) if rpe_log else None
 
-    insight_cards: list[dict] = []
+        st.subheader("Insights Feed")
 
-    def add_card(category: str, title: str, value: str, *, delta: str | None = None, description: str | None = None):
-        insight_cards.append(
-            {
-                "category": category,
-                "title": title,
-                "value": value,
-                "delta": delta,
-                "description": description,
-            }
-        )
+        insight_cards: list[dict] = []
 
-    if "goal_active" in df.columns and df["goal_active"].any():
-        recent_goal_days = last7[last7["goal_active"]]
-        if not recent_goal_days.empty:
-            cal_comp = recent_goal_days["goal_calorie_met"].mean()
-            cal_delta = recent_goal_days["goal_calorie_delta"].mean()
-            _, long_streak = streak_lengths(recent_goal_days["goal_calorie_met"])
-            add_card(
-                "Goals",
-                "Calorie goal hit rate",
-                f"{cal_comp * 100:.0f}%",
-                delta=f"{cal_delta:+.0f} kcal vs target",
-                description=f"Longest streak: {long_streak} days",
+        def add_card(category: str, title: str, value: str, *, delta: str | None = None, description: str | None = None):
+            if category not in st.session_state.get("selected_categories", CARD_CATEGORIES):
+                return
+            insight_cards.append(
+                {
+                    "category": category,
+                    "title": title,
+                    "value": value,
+                    "delta": delta,
+                    "description": description,
+                }
             )
 
-            deficit_streak, _ = streak_lengths(recent_goal_days["goal_calorie_delta"] < -150)
-            surplus_streak, _ = streak_lengths(recent_goal_days["goal_calorie_delta"] > 150)
-            if deficit_streak >= 3:
-                add_card("Goals", "Deficit streak", f"{deficit_streak} days", description="Running calorie deficit vs goal.")
-            if surplus_streak >= 3:
-                add_card("Goals", "Surplus streak", f"{surplus_streak} days", description="Running calorie surplus vs goal.")
+        if "goal_active" in scoped.columns and scoped["goal_active"].any():
+            recent_goal_days = scoped[scoped["goal_active"]]
+            if not recent_goal_days.empty:
+                cal_comp = recent_goal_days["goal_calorie_met"].mean()
+                cal_delta = recent_goal_days["goal_calorie_delta"].mean() if "goal_calorie_delta" in recent_goal_days.columns else None
+                _, long_streak = streak_lengths(recent_goal_days["goal_calorie_met"])
+                add_card(
+                    "Goals",
+                    "Calorie goal hit rate",
+                    f"{cal_comp * 100:.0f}%",
+                    delta=format_delta_text(cal_delta, "kcal vs goal"),
+                    description=f"Longest streak: {long_streak} days",
+                )
 
-        if "goal_protein_met" in df.columns and not last7.empty:
-            protein_comp = last7[last7["goal_active"]]["goal_protein_met"].mean()
-            add_card(
-                "Goals",
-                "Protein goal hit rate",
-                f"{protein_comp * 100:.0f}%",
-                description="Share of goal-active days hitting protein in last week",
-            )
+                deficit_streak, _ = streak_lengths(recent_goal_days["goal_calorie_delta"] < -150)
+                surplus_streak, _ = streak_lengths(recent_goal_days["goal_calorie_delta"] > 150)
+                if deficit_streak >= 3:
+                    add_card("Goals", "Deficit streak", f"{deficit_streak} days", description="Running calorie deficit vs goal.")
+                if surplus_streak >= 3:
+                    add_card("Goals", "Surplus streak", f"{surplus_streak} days", description="Running calorie surplus vs goal.")
 
-    if len(last7) >= 5:
-        kcal_delta = rolling_delta(df["calories_kcal"], window=3)
-        if kcal_delta:
-            delta, pct = kcal_delta
-            direction = "▲" if delta > 0 else "▼"
-            add_card(
-                "Energy",
-                "3-day calorie trend",
-                f"{direction} {abs(delta):.0f} kcal",
-                delta=f"{pct:+.0%} vs prior window",
-            )
+            if "goal_protein_met" in scoped.columns and not scoped.empty:
+                protein_comp = scoped[scoped["goal_active"]]["goal_protein_met"].mean()
+                add_card(
+                    "Goals",
+                    "Protein goal hit rate",
+                    f"{protein_comp * 100:.0f}%",
+                    description="Share of goal-active days hitting protein",
+                )
 
-    if (last7["calories_kcal"] > 0).sum() >= 3:
-        avg_out = last7["garmin_calories_kcal"].mean() if (last7["garmin_calories_kcal"] > 0).any() else None
-        if avg_out:
-            net = avg_in_last7 - avg_out
+        if len(scoped) >= 5 and "calories_kcal" in scoped.columns:
+            kcal_delta = rolling_delta(scoped["calories_kcal"], window=3)
+            if kcal_delta:
+                delta, pct = kcal_delta
+                trend = "up" if delta > 0 else "down"
+                add_card(
+                    "Energy",
+                    "3-day calorie trend",
+                    f"{trend} {abs(delta):.0f} kcal",
+                    delta=f"{pct:+.0%} vs prior window",
+                )
+
+        if (kcal_out > 0).any():
+            avg_out = kcal_out.mean()
+            net = avg_in - avg_out
             balance_label = "deficit" if net < -200 else "surplus" if net > 200 else "near even"
             add_card(
                 "Energy",
-                "Weekly energy balance",
+                "Energy balance",
                 f"{net:+.0f} kcal/day",
-                description=f"Last 7d average ({balance_label})",
+                delta=format_delta_text(avg_in - prev_in, "kcal vs prior") if prev_in else None,
+                description=f"{balance_label} on {window_days}d average",
             )
 
-    if (steps > 0).any():
-        steps_delta = rolling_delta(df["garmin_steps"].fillna(0), window=3)
-        if steps_delta:
-            delta, pct = steps_delta
-            direction = "▲" if delta > 0 else "▼"
-            add_card(
-                "Activity",
-                "3-day steps trend",
-                f"{direction} {abs(delta):,.0f}",
-                delta=f"{pct:+.0%} vs prior window",
-            )
+        if (steps > 0).any():
+            steps_delta = rolling_delta(scoped["garmin_steps"].fillna(0), window=3) if "garmin_steps" in scoped.columns else None
+            if steps_delta:
+                delta, pct = steps_delta
+                trend = "up" if delta > 0 else "down"
+                add_card(
+                    "Activity",
+                    "3-day steps trend",
+                    f"{trend} {abs(delta):,.0f}",
+                    delta=f"{pct:+.0%} vs prior window",
+                )
 
-        prev7 = df.tail(14).head(7)
-        if (prev7["garmin_steps"] > 0).any():
-            delta = avg_steps_last7 - prev7["garmin_steps"].mean()
-            trend = "▲" if delta > 0 else "▼" if delta < 0 else "→"
-            add_card(
-                "Activity",
-                "Steps week-over-week",
-                f"{avg_steps_last7:,.0f} steps",
-                delta=f"{trend} {delta:+,.0f} vs prior week",
-            )
+            prev7 = previous_scope.tail(window_days)
+            if not prev7.empty and "garmin_steps" in prev7.columns:
+                delta = avg_steps - prev7["garmin_steps"].mean()
+                trend = "up" if delta > 0 else "down" if delta < 0 else "flat"
+                add_card(
+                    "Activity",
+                    "Steps week-over-week",
+                    f"{avg_steps:,.0f} steps",
+                    delta=f"{trend} {delta:+,.0f} vs prior window",
+                )
 
-    if (protein > 0).any():
-        low_protein_days = (protein < 90).sum()
-        if low_protein_days >= 3:
-            add_card("Nutrition", "Low protein days", str(int(low_protein_days)), description="Logged under 90g protein")
+        if (protein > 0).any():
+            low_protein_days = (protein < 90).sum()
+            if low_protein_days >= 3:
+                add_card("Nutrition", "Low protein days", str(int(low_protein_days)), description="Logged under 90g protein")
 
-    if len(last7) >= 3 and (volume > 0).any():
-        vol_delta = rolling_delta(df["hevy_volume_kg"].fillna(0), window=3)
-        if vol_delta:
-            delta, pct = vol_delta
-            direction = "▲" if delta > 0 else "▼"
+        if len(scoped) >= 3 and (volume > 0).any():
+            vol_delta = rolling_delta(scoped["hevy_volume_kg"].fillna(0), window=3) if "hevy_volume_kg" in scoped.columns else None
+            if vol_delta:
+                delta, pct = vol_delta
+                trend = "up" if delta > 0 else "down"
+                add_card(
+                    "Training",
+                    "Lifting volume trend",
+                    f"{trend} {abs(delta):.0f} kg",
+                    delta=f"{pct:+.0%} vs prior window",
+                )
+
             add_card(
                 "Training",
-                "Lifting volume trend",
-                f"{direction} {abs(delta):.0f} kg",
-                delta=f"{pct:+.0%} vs prior window",
+                f"Avg lifting volume ({window_days}d)",
+                f"{avg_volume:,.0f} kg/day",
+                description="Based on logged days in window",
             )
 
-        add_card(
-            "Training",
-            "Avg lifting volume (7d)",
-            f"{avg_volume_last7:,.0f} kg/day",
-            description="Based on last 7 logged days",
-        )
+        if avg_rpe:
+            if avg_rpe >= 8:
+                add_card("Recovery", "Average RPE", f"{avg_rpe:.1f}", description="High effort, prioritize recovery")
+            elif avg_rpe <= 6.5:
+                add_card("Recovery", "Average RPE", f"{avg_rpe:.1f}", description="Effort is comfortable; progression possible")
 
-    if avg_rpe:
-        if avg_rpe >= 8:
-            add_card("Recovery", "Average RPE", f"{avg_rpe:.1f}", description="High effort—prioritize recovery")
-        elif avg_rpe <= 6.5:
-            add_card("Recovery", "Average RPE", f"{avg_rpe:.1f}", description="Effort is comfortable; progression possible")
+        if (kcal_out > 0).any():
+            heavy_days = scoped[scoped["garmin_calories_kcal"] > 600]
+            if not heavy_days.empty:
+                underfed = heavy_days[heavy_days["calories_kcal"] < heavy_days["garmin_calories_kcal"] - 300]
+                if not underfed.empty:
+                    d = underfed.iloc[-1]["date"].date()
+                    add_card("Energy", "High burn day", f"{d}", description="Burn exceeded intake by >300 kcal")
 
-    if (kcal_out > 0).any():
-        heavy_days = df[df["garmin_calories_kcal"] > 600]
-        if not heavy_days.empty:
-            underfed = heavy_days[heavy_days["calories_kcal"] < heavy_days["garmin_calories_kcal"] - 300]
-            if not underfed.empty:
-                d = underfed.iloc[-1]["date"].date()
-                add_card("Energy", "High burn day", f"{d}", description="Burn exceeded intake by >300 kcal")
+        weekend = scoped[scoped["date"].dt.weekday >= 5]
+        if not weekend.empty:
+            w_kcal = weekend["calories_kcal"].mean()
+            wd_kcal = scoped[scoped["date"].dt.weekday < 5]["calories_kcal"].mean()
+            delta = w_kcal - wd_kcal
+            add_card(
+                "Habits",
+                "Weekend intake",
+                f"{w_kcal:,.0f} kcal",
+                delta=f"{delta:+.0f} vs weekdays",
+            )
 
-    weekend = df[df["date"].dt.weekday >= 5]
-    if not weekend.empty:
-        w_kcal = weekend["calories_kcal"].mean()
-        wd_kcal = df[df["date"].dt.weekday < 5]["calories_kcal"].mean()
-        delta = w_kcal - wd_kcal
-        add_card(
-            "Habits",
-            "Weekend intake",
-            f"{w_kcal:,.0f} kcal",
-            delta=f"{delta:+.0f} vs weekdays",
-        )
+        if not insight_cards:
+            st.info("No significant patterns detected yet.")
+        else:
+            ordered_cats = compute_category_order(st.session_state.get("selected_categories", CARD_CATEGORIES))
+            for cat in ordered_cats:
+                cat_cards = [c for c in insight_cards if c["category"] == cat]
+                if not cat_cards:
+                    continue
+                st.markdown(f"**{cat}**")
+                for i in range(0, len(cat_cards), 3):
+                    cols = st.columns(min(3, len(cat_cards) - i))
+                    for col, card in zip(cols, cat_cards[i : i + 3]):
+                        with col:
+                            st.metric(card["title"], card["value"], delta=card.get("delta"))
+                            if card.get("description"):
+                                st.caption(card.get("description"))
 
-    if not insight_cards:
-        st.info("No significant patterns detected yet.")
-    else:
-        categories = sorted({c["category"] for c in insight_cards})
-        for cat in categories:
-            st.markdown(f"**{cat}**")
-            cat_cards = [c for c in insight_cards if c["category"] == cat]
-            for i in range(0, len(cat_cards), 3):
-                cols = st.columns(min(3, len(cat_cards) - i))
-                for col, card in zip(cols, cat_cards[i : i + 3]):
-                    with col:
-                        st.metric(card["title"], card["value"], delta=card.get("delta"))
-                        if card.get("description"):
-                            st.caption(card["description"])
+        st.subheader("Health & Performance Flags")
 
-    st.subheader("Health & Performance Flags")
+        flags = []
 
-    flags = []
+        if "goal_active" in scoped.columns and scoped["goal_active"].any():
+            goal_days = scoped[scoped["goal_active"]]
+            cal_comp = goal_days["goal_calorie_met"].mean() if not goal_days.empty else 0
+            prot_comp = goal_days["goal_protein_met"].mean() if not goal_days.empty else 0
+            steps_comp = goal_days["goal_steps_met"].mean() if not goal_days.empty else 0
 
-    if "goal_active" in df.columns and df["goal_active"].any():
-        goal_days = last7[last7["goal_active"]]
-        cal_comp = goal_days["goal_calorie_met"].mean() if not goal_days.empty else 0
-        prot_comp = goal_days["goal_protein_met"].mean() if not goal_days.empty else 0
-        steps_comp = goal_days["goal_steps_met"].mean() if not goal_days.empty else 0
+            if cal_comp < 0.35:
+                flags.append(("red", "Calorie goal rarely met in the selected window."))
+            elif cal_comp < 0.6:
+                flags.append(("amber", "Calorie goal compliance is moderate."))
 
-        if cal_comp < 0.35:
-            flags.append(("red", "Calorie goal rarely met over the last week."))
-        elif cal_comp < 0.6:
-            flags.append(("amber", "Calorie goal compliance is moderate."))
+            if prot_comp < 0.4:
+                flags.append(("amber", "Protein goal often missed."))
 
-        if prot_comp < 0.4:
-            flags.append(("amber", "Protein goal often missed."))
+            if steps_comp < 0.5:
+                flags.append(("amber", "Steps goal often missed."))
 
-        if steps_comp < 0.5:
-            flags.append(("amber", "Steps goal often missed."))
+            if cal_comp >= 0.7 and prot_comp >= 0.7 and steps_comp >= 0.7:
+                flags.append(("green", "Strong compliance across calorie, protein, and steps goals."))
+        else:
+            if avg_in < 1400:
+                flags.append(("red", "Daily intake very low; risk of under-fueling."))
+            if protein.mean() < 90:
+                flags.append(("red", "Protein intake consistently low; prioritize protein-rich meals."))
+            if avg_steps < 6000:
+                flags.append(("amber", "Low activity trend; steps below 6000 on average."))
+            if avg_in > 1800 and protein.mean() > 120:
+                flags.append(("green", "Nutrition profile supports strength and recovery."))
 
-        if cal_comp >= 0.7 and prot_comp >= 0.7 and steps_comp >= 0.7:
-            flags.append(("green", "Strong compliance across calorie, protein, and steps goals."))
-    else:
-        if avg_in_last7 < 1400:
-            flags.append(("red", "Daily intake very low; risk of under-fueling."))
-        if protein.mean() < 90:
-            flags.append(("red", "Protein intake consistently low; prioritize protein-rich meals."))
-        if avg_steps_last7 < 6000:
-            flags.append(("amber", "Low activity trend; steps below 6000 on average."))
-        if avg_in_last7 > 1800 and protein.mean() > 120:
-            flags.append(("green", "Nutrition profile supports strength and recovery."))
+        if avg_rpe and avg_rpe >= 8.5:
+            flags.append(("amber", f"Average RPE is high ({avg_rpe:.1f}); watch fatigue and sleep."))
+        if body_weight and body_weight > 0 and avg_volume > 0:
+            rel_weekly = (scoped["hevy_volume_kg"].sum() if "hevy_volume_kg" in scoped.columns else 0) / body_weight
+            if rel_weekly > 180:
+                flags.append(("amber", f"Heavy relative lifting load this window (~{rel_weekly:.0f} kg/kg bodyweight)."))
 
-    if avg_rpe and avg_rpe >= 8.5:
-        flags.append(("amber", f"Average RPE is high ({avg_rpe:.1f}); watch fatigue and sleep."))
-    if body_weight and body_weight > 0 and avg_volume_last7 > 0:
-        rel_weekly = (last7["hevy_volume_kg"].sum() if "hevy_volume_kg" in last7.columns else 0) / body_weight
-        if rel_weekly > 180:
-            flags.append(("amber", f"Heavy relative lifting load this week (~{rel_weekly:.0f} kg/kg bodyweight)."))
+        for level, msg in flags:
+            if level == "red":
+                st.error(msg)
+            elif level == "amber":
+                st.warning(msg)
+            elif level == "green":
+                st.success(msg)
 
-    for level, msg in flags:
-        if level == "red":
-            st.error(msg)
-        elif level == "amber":
-            st.warning(msg)
-        elif level == "green":
-            st.success(msg)
+        st.subheader("Patterns Detected")
 
-    st.subheader("Patterns Detected")
+        patterns = []
 
-    patterns = []
+        if "goal_calorie_delta" in scoped.columns:
+            surplus_run = streak_lengths(scoped["goal_calorie_delta"] > 200)[0]
+            deficit_run = streak_lengths(scoped["goal_calorie_delta"] < -200)[0]
+            if surplus_run >= 3:
+                patterns.append("Calorie surplus streak detected (3+ days above goal).")
+            if deficit_run >= 3:
+                patterns.append("Calorie deficit streak detected (3+ days below goal).")
 
-    if "goal_calorie_delta" in df.columns:
-        surplus_run = streak_lengths(df["goal_calorie_delta"] > 200)[0]
-        deficit_run = streak_lengths(df["goal_calorie_delta"] < -200)[0]
-        if surplus_run >= 3:
-            patterns.append("Calorie surplus streak detected (3+ days above goal).")
-        if deficit_run >= 3:
-            patterns.append("Calorie deficit streak detected (3+ days below goal).")
+        lowp = (scoped["protein_g"] < 100).rolling(3).sum() if "protein_g" in scoped.columns else pd.Series(dtype=float)
+        if not lowp.empty and (lowp == 3).any():
+            patterns.append("3-day low protein streak detected.")
 
-    lowp = (df["protein_g"] < 100).rolling(3).sum()
-    if (lowp == 3).any():
-        patterns.append("3-day low protein streak detected.")
+        if (scoped.get("calories_kcal", pd.Series(dtype=float)) == 0).sum() >= 2:
+            patterns.append("Several days with no nutrition logged; insights may be incomplete.")
 
-    if (df["calories_kcal"] == 0).sum() >= 2:
-        patterns.append("Several days with no nutrition logged; insights may be incomplete.")
+        if "garmin_steps" in scoped.columns and scoped["garmin_steps"].std() > 5000:
+            patterns.append("High variability in step count; daily movement inconsistent.")
 
-    if df["garmin_steps"].std() > 5000:
-        patterns.append("High variability in step count; daily movement inconsistent.")
-
-    if not patterns:
-        st.info("No notable patterns this week.")
-    else:
-        for p in patterns:
-            st.write(f"- {p}")
+        if not patterns:
+            st.info("No notable patterns this window.")
+        else:
+            for p in patterns:
+                st.write(f"- {p}")
