@@ -811,11 +811,10 @@ else:
     chart_cols = st.columns(2)
 
     with chart_cols[0]:
-        st.markdown("**Calories and steps over time**")
+        st.markdown("**Calories over time**")
         chart_df = df[["date"]].copy()
         chart_df["intake_kcal"] = calories
         chart_df["garmin_kcal"] = g_calories
-        chart_df["steps"] = steps
         chart_df = chart_df.set_index("date")
         st.line_chart(chart_df)
 
@@ -827,25 +826,6 @@ else:
         macro_df["fat_g"] = fat
         macro_df = macro_df.set_index("date")
         st.line_chart(macro_df)
-
-    st.subheader("Basic correlations")
-
-    corr_rows = []
-
-    if len(calories[calories > 0]) >= 3 and len(steps[steps > 0]) >= 3:
-        corr_steps_kcal = calories.corr(steps)
-        corr_rows.append({"pair": "Calories vs steps", "correlation": corr_steps_kcal})
-
-    if len(calories[calories > 0]) >= 3 and len(g_calories[g_calories > 0]) >= 3:
-        corr_intake_vs_garmin = calories.corr(g_calories)
-        corr_rows.append({"pair": "Intake kcal vs Garmin kcal", "correlation": corr_intake_vs_garmin})
-
-    if corr_rows:
-        corr_df = pd.DataFrame(corr_rows)
-        corr_df["correlation"] = corr_df["correlation"].round(2)
-        st.table(corr_df)
-    else:
-        st.info("Not enough overlapping data to compute correlations yet.")
 
     st.subheader("Best and worst days")
 
@@ -898,102 +878,125 @@ else:
 
     st.subheader("Insights Feed")
 
-    insights = []
+    insight_cards: list[dict] = []
+
+    def add_card(category: str, title: str, value: str, *, delta: str | None = None, description: str | None = None):
+        insight_cards.append(
+            {
+                "category": category,
+                "title": title,
+                "value": value,
+                "delta": delta,
+                "description": description,
+            }
+        )
 
     if "goal_active" in df.columns and df["goal_active"].any():
         recent_goal_days = last7[last7["goal_active"]]
         if not recent_goal_days.empty:
             cal_comp = recent_goal_days["goal_calorie_met"].mean()
             cal_delta = recent_goal_days["goal_calorie_delta"].mean()
-            cur_streak, long_streak = streak_lengths(recent_goal_days["goal_calorie_met"])
-            insights.append(
-                f"Calorie goal met {cal_comp * 100:.0f}% of the last {len(recent_goal_days)} goal days "
-                f"({cal_delta:+.0f} kcal average vs target). Longest recent streak: {long_streak} days."
+            _, long_streak = streak_lengths(recent_goal_days["goal_calorie_met"])
+            add_card(
+                "Goals",
+                "Calorie goal hit rate",
+                f"{cal_comp * 100:.0f}%",
+                delta=f"{cal_delta:+.0f} kcal vs target",
+                description=f"Longest streak: {long_streak} days",
             )
+
             deficit_streak, _ = streak_lengths(recent_goal_days["goal_calorie_delta"] < -150)
             surplus_streak, _ = streak_lengths(recent_goal_days["goal_calorie_delta"] > 150)
             if deficit_streak >= 3:
-                insights.append("Running deficit streak against your calorie goal (3+ days).")
+                add_card("Goals", "Deficit streak", f"{deficit_streak} days", description="Running calorie deficit vs goal.")
             if surplus_streak >= 3:
-                insights.append("Running surplus streak against your calorie goal (3+ days).")
+                add_card("Goals", "Surplus streak", f"{surplus_streak} days", description="Running calorie surplus vs goal.")
 
         if "goal_protein_met" in df.columns and not last7.empty:
             protein_comp = last7[last7["goal_active"]]["goal_protein_met"].mean()
-            insights.append(f"Protein goal hit rate: {protein_comp * 100:.0f}% of goal-active days in the last week.")
-
-        if "goal_steps_met" in df.columns and not last7.empty:
-            steps_comp = last7[last7["goal_active"]]["goal_steps_met"].mean()
-            insights.append(f"Steps goal hit rate: {steps_comp * 100:.0f}% of goal-active days in the last week.")
-
-    kcal_trend = rolling_delta(kcal_in, window=7)
-    steps_trend = rolling_delta(steps, window=7)
-    vol_trend = rolling_delta(volume, window=7) if not volume.empty else None
-
-    def _trend_text(label: str, trend: tuple[float, float] | None, unit: str) -> str | None:
-        if not trend:
-            return None
-        delta, pct = trend
-        if abs(delta) < (1 if unit == "kg" else 50):
-            direction = "stable"
-        elif delta > 0:
-            direction = "rising"
-        else:
-            direction = "falling"
-        return f"{label} {direction} ({delta:+.0f} {unit} vs prior week, {pct * 100:+.0f}%)."
-
-    for text in [
-        _trend_text("Calorie intake", kcal_trend, "kcal"),
-        _trend_text("Steps", steps_trend, "steps"),
-        _trend_text("Training volume", vol_trend, "kg"),
-    ]:
-        if text:
-            insights.append(text)
-
-    if kcal_trend and steps_trend:
-        if kcal_trend[0] > 100 and steps_trend[0] < -500:
-            insights.append("Energy intake is creeping up while steps are dropping; watch balance.")
-        elif kcal_trend[0] < -100 and steps_trend[0] > 500:
-            insights.append("You are eating less while moving more—ensure recovery and protein are solid.")
-
-    if vol_trend and abs(vol_trend[0]) > 200:
-        if avg_rpe and avg_rpe >= 8:
-            insights.append(
-                f"Volume change ({vol_trend[0]:+.0f} kg) paired with high RPE ({avg_rpe:.1f}); consider a deload or extra rest."
+            add_card(
+                "Goals",
+                "Protein goal hit rate",
+                f"{protein_comp * 100:.0f}%",
+                description="Share of goal-active days hitting protein in last week",
             )
-        elif body_weight and body_weight > 0:
-            rel_load = (last7["hevy_volume_kg"].sum() if "hevy_volume_kg" in last7.columns else 0) / body_weight
-            if rel_load > 150:
-                insights.append(
-                    f"High relative load this week (~{rel_load:.0f} kg per kg bodyweight). Keep sleep and fueling tight."
-                )
 
-    if avg_rpe is not None:
-        if avg_rpe >= 8.5:
-            insights.append("RPE trend is high; prioritize recovery days and lighter accessories.")
-        elif avg_rpe <= 6 and avg_volume_last7 > 0 and (vol_trend and vol_trend[0] <= 0):
-            insights.append("RPE is comfortable and volume is flat/down—could add a small progression next week.")
+    if len(last7) >= 5:
+        kcal_delta = rolling_delta(df["calories_kcal"], window=3)
+        if kcal_delta:
+            delta, pct = kcal_delta
+            direction = "▲" if delta > 0 else "▼"
+            add_card(
+                "Energy",
+                "3-day calorie trend",
+                f"{direction} {abs(delta):.0f} kcal",
+                delta=f"{pct:+.0%} vs prior window",
+            )
 
     if (last7["calories_kcal"] > 0).sum() >= 3:
         avg_out = last7["garmin_calories_kcal"].mean() if (last7["garmin_calories_kcal"] > 0).any() else None
         if avg_out:
             net = avg_in_last7 - avg_out
-            if net < -200:
-                insights.append(f"Consistent weekly deficit (~{abs(net):.0f} kcal/day).")
-            elif net > 200:
-                insights.append(f"Consistent weekly surplus (~{net:.0f} kcal/day).")
-            else:
-                insights.append("Weekly energy balance is near maintenance.")
+            balance_label = "deficit" if net < -200 else "surplus" if net > 200 else "near even"
+            add_card(
+                "Energy",
+                "Weekly energy balance",
+                f"{net:+.0f} kcal/day",
+                description=f"Last 7d average ({balance_label})",
+            )
 
-    if (last7["garmin_steps"] > 0).any():
+    if (steps > 0).any():
+        steps_delta = rolling_delta(df["garmin_steps"].fillna(0), window=3)
+        if steps_delta:
+            delta, pct = steps_delta
+            direction = "▲" if delta > 0 else "▼"
+            add_card(
+                "Activity",
+                "3-day steps trend",
+                f"{direction} {abs(delta):,.0f}",
+                delta=f"{pct:+.0%} vs prior window",
+            )
+
         prev7 = df.tail(14).head(7)
         if (prev7["garmin_steps"] > 0).any():
             delta = avg_steps_last7 - prev7["garmin_steps"].mean()
-            if delta > 1000:
-                insights.append("Daily steps are trending upward compared to the prior week.")
-            elif delta < -1000:
-                insights.append("Daily steps are trending downward compared to the prior week.")
-            else:
-                insights.append("Steps are stable week-over-week.")
+            trend = "▲" if delta > 0 else "▼" if delta < 0 else "→"
+            add_card(
+                "Activity",
+                "Steps week-over-week",
+                f"{avg_steps_last7:,.0f} steps",
+                delta=f"{trend} {delta:+,.0f} vs prior week",
+            )
+
+    if (protein > 0).any():
+        low_protein_days = (protein < 90).sum()
+        if low_protein_days >= 3:
+            add_card("Nutrition", "Low protein days", str(int(low_protein_days)), description="Logged under 90g protein")
+
+    if len(last7) >= 3 and (volume > 0).any():
+        vol_delta = rolling_delta(df["hevy_volume_kg"].fillna(0), window=3)
+        if vol_delta:
+            delta, pct = vol_delta
+            direction = "▲" if delta > 0 else "▼"
+            add_card(
+                "Training",
+                "Lifting volume trend",
+                f"{direction} {abs(delta):.0f} kg",
+                delta=f"{pct:+.0%} vs prior window",
+            )
+
+        add_card(
+            "Training",
+            "Avg lifting volume (7d)",
+            f"{avg_volume_last7:,.0f} kg/day",
+            description="Based on last 7 logged days",
+        )
+
+    if avg_rpe:
+        if avg_rpe >= 8:
+            add_card("Recovery", "Average RPE", f"{avg_rpe:.1f}", description="High effort—prioritize recovery")
+        elif avg_rpe <= 6.5:
+            add_card("Recovery", "Average RPE", f"{avg_rpe:.1f}", description="Effort is comfortable; progression possible")
 
     if (kcal_out > 0).any():
         heavy_days = df[df["garmin_calories_kcal"] > 600]
@@ -1001,24 +1004,34 @@ else:
             underfed = heavy_days[heavy_days["calories_kcal"] < heavy_days["garmin_calories_kcal"] - 300]
             if not underfed.empty:
                 d = underfed.iloc[-1]["date"].date()
-                insights.append(
-                    f"On {d}, high burn with low intake. Consider increasing carbs on demanding days."
-                )
+                add_card("Energy", "High burn day", f"{d}", description="Burn exceeded intake by >300 kcal")
 
     weekend = df[df["date"].dt.weekday >= 5]
     if not weekend.empty:
         w_kcal = weekend["calories_kcal"].mean()
         wd_kcal = df[df["date"].dt.weekday < 5]["calories_kcal"].mean()
-        if w_kcal < wd_kcal - 200:
-            insights.append("You undereat on weekends compared to weekdays.")
-        elif w_kcal > wd_kcal + 200:
-            insights.append("You overeat on weekends compared to weekdays.")
+        delta = w_kcal - wd_kcal
+        add_card(
+            "Habits",
+            "Weekend intake",
+            f"{w_kcal:,.0f} kcal",
+            delta=f"{delta:+.0f} vs weekdays",
+        )
 
-    if not insights:
+    if not insight_cards:
         st.info("No significant patterns detected yet.")
     else:
-        for insight in insights:
-            st.markdown(f"- {insight}")
+        categories = sorted({c["category"] for c in insight_cards})
+        for cat in categories:
+            st.markdown(f"**{cat}**")
+            cat_cards = [c for c in insight_cards if c["category"] == cat]
+            for i in range(0, len(cat_cards), 3):
+                cols = st.columns(min(3, len(cat_cards) - i))
+                for col, card in zip(cols, cat_cards[i : i + 3]):
+                    with col:
+                        st.metric(card["title"], card["value"], delta=card.get("delta"))
+                        if card.get("description"):
+                            st.caption(card["description"])
 
     st.subheader("Health & Performance Flags")
 
