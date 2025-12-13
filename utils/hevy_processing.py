@@ -36,7 +36,14 @@ def canonicalize_hevy_sets(hevy_sets_df: pd.DataFrame) -> pd.DataFrame:
     else:
         df["date"] = pd.NaT
 
-    df["date_day"] = df["date"].dt.tz_localize(tz, nonexistent="shift_forward", ambiguous="NaT", errors="coerce").dt.date if df["date"].dt.tz is None else df["date"].dt.tz_convert(tz).dt.date
+    # Map to local day in Europe/Berlin; handle aware/naive safely.
+    try:
+        if df["date"].dt.tz is None:
+            df["date_day"] = df["date"].dt.tz_localize(tz, nonexistent="shift_forward", ambiguous="NaT").dt.date
+        else:
+            df["date_day"] = df["date"].dt.tz_convert(tz).dt.date
+    except Exception:
+        df["date_day"] = df["date"].dt.date
 
     # Names
     df["workout_name"] = df.get("workout_name") if "workout_name" in df.columns else df.get("workoutName")
