@@ -584,8 +584,8 @@ def main():
         st.session_state["goal_config"] = load_user_goal(st.session_state["user_id"])
 
     st.title("Fitness Hub - Core Integrations Test")
-    setup_tab, goals_tab, dashboard_tab, coach_tab, data_tab = st.tabs(
-        ["Setup & Connections", "Goals & Personalization", "Dashboard", "Coach & Insights", "Data & Debug"]
+    setup_tab, goals_tab, dashboard_tab, coach_tab, weight_tab, data_tab = st.tabs(
+        ["Setup & Connections", "Goals & Personalization", "Dashboard", "Coach & Insights", "Weightlifting", "Data & Debug"]
     )
 
     with setup_tab:
@@ -1327,6 +1327,13 @@ def main():
                 else:
                     for p in patterns:
                         st.write(f"- {p}")
+
+    with weight_tab:
+        try:
+            from tabs.weightlifting_tab import render_weightlifting_tab
+            render_weightlifting_tab()
+        except Exception as exc:
+            st.error(f"Weightlifting tab error: {exc}")
 
     with data_tab:
         st.header("Data & debug")
