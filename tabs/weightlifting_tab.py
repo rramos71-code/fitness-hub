@@ -27,6 +27,10 @@ def render_weightlifting_tab() -> None:
     if not show_warmups:
         sets_df = sets_df[sets_df["is_working_set"]]
 
+    if sets_df is None or sets_df.empty:
+        st.info("No working sets yet. Try including warmups or sync again.")
+        return
+
     # Summary metrics
     today = pd.Timestamp.utcnow().date()
     seven_start = today - pd.Timedelta(days=7)

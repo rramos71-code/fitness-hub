@@ -32,15 +32,12 @@ def canonicalize_hevy_sets(hevy_sets_df: pd.DataFrame) -> pd.DataFrame:
     # Date handling
     tz = ZoneInfo("Europe/Berlin")
     date_col = None
-    for cand in ["date", "startTime", "start_time", "performed_at", "performedAt", "createdAt"]:
+    for cand in ["date", "startTime", "start_time", "performed_at", "performedAt", "createdAt", "loggedAt"]:
         if cand in df.columns:
             date_col = cand
             break
 
-    if date_col:
-        df["date"] = pd.to_datetime(df[date_col], errors="coerce")
-    else:
-        df["date"] = pd.NaT
+    df["date"] = pd.to_datetime(df[date_col], errors="coerce") if date_col else pd.NaT
 
     try:
         if df["date"].dt.tz is None:
@@ -55,7 +52,14 @@ def canonicalize_hevy_sets(hevy_sets_df: pd.DataFrame) -> pd.DataFrame:
     # Names
     df["workout_name"] = df["workout_name"] if "workout_name" in df.columns else df.get("workoutName")
     df["template_name"] = df["template_name"] if "template_name" in df.columns else df.get("templateName")
-    df["exercise_name"] = df["exercise_name"] if "exercise_name" in df.columns else df.get("exerciseName")
+
+    exercise_col = None
+    for cand in ["exercise_name", "exerciseName", "name", "title"]:
+        if cand in df.columns:
+            exercise_col = cand
+            break
+    df["exercise_name"] = df[exercise_col] if exercise_col else pd.NA
+
     df["set_index"] = df["set_index"] if "set_index" in df.columns else df.get("setIndex")
     df["set_type"] = df["set_type"] if "set_type" in df.columns else df.get("setType")
 
@@ -71,6 +75,10 @@ def canonicalize_hevy_sets(hevy_sets_df: pd.DataFrame) -> pd.DataFrame:
     df["reps"] = pd.to_numeric(reps_series, errors="coerce")
     rir_series = df["rir"] if "rir" in df.columns else df.get("rpe")
     df["rir"] = pd.to_numeric(rir_series, errors="coerce")
+
+    # Set index fallback
+    if "set_index" not in df or df["set_index"].isna().all():
+        df["set_index"] = range(1, len(df) + 1)
 
     # Set type normalization
     df["set_type"] = df["set_type"].fillna("work").astype(str).str.lower()
