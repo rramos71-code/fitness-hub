@@ -6,6 +6,7 @@ from typing import Dict, Any
 import pandas as pd
 import streamlit as st
 from google.oauth2.credentials import Credentials
+from google.auth.exceptions import RefreshError
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 
@@ -24,6 +25,10 @@ class GoogleFitClient:
     """
 
     def __init__(self) -> None:
+        self.creds = self._build_credentials()
+        self.service = build("fitness", "v1", credentials=self.creds)
+
+    def _build_credentials(self) -> Credentials:
         token_json = st.secrets.get("GOOGLE_FIT_TOKEN_JSON")
         client_id = st.secrets.get("GOOGLE_FIT_CLIENT_ID")
         client_secret = st.secrets.get("GOOGLE_FIT_CLIENT_SECRET")
@@ -39,15 +44,27 @@ class GoogleFitClient:
         info.setdefault("client_secret", client_secret)
 
         creds = Credentials.from_authorized_user_info(info, scopes=SCOPES)
+
         if not creds.valid:
             if creds.expired and creds.refresh_token:
-                creds.refresh(Request())
+                try:
+                    creds.refresh(Request())
+                    # Cache the refreshed token in session_state for the current run.
+                    st.session_state["google_fit_token_json"] = creds.to_json()
+                except RefreshError as exc:
+                    raise RuntimeError(
+                        "Google Fit refresh failed. Re-authenticate and update GOOGLE_FIT_TOKEN_JSON."
+                    ) from exc
+                except Exception as exc:
+                    raise RuntimeError(
+                        "Google Fit refresh failed due to an unexpected error."
+                    ) from exc
             else:
                 raise RuntimeError(
-                    "Stored Google Fit credentials are invalid and cannot be refreshed."
+                    "Stored Google Fit credentials are invalid or missing refresh_token; re-authenticate and replace GOOGLE_FIT_TOKEN_JSON."
                 )
 
-        self.service = build("fitness", "v1", credentials=creds)
+        return creds
 
     # ------------------------------------------------------------------
     def _aggregate_request(self, days_back: int) -> Dict[str, Any]:

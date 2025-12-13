@@ -562,6 +562,13 @@ def get_googlefit_client() -> GoogleFitClient | None:
         return gf_client
     except google_auth_exceptions.RefreshError:
         st.error("Google Fit authentication has expired. Please re-authenticate and reload.")
+    except RuntimeError as exc:
+        st.error(
+            "Google Fit authentication error: "
+            f"{exc} "
+            "Steps: (1) re-run the OAuth helper to obtain a fresh token JSON with refresh_token, "
+            "(2) update GOOGLE_FIT_TOKEN_JSON in secrets, (3) reload the app."
+        )
     except Exception as exc:
         st.error(f"Google Fit initialization error: {exc}")
     return None
