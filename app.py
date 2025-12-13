@@ -1208,9 +1208,9 @@ def main():
                     elif avg_rpe <= 6.5:
                         add_card("Recovery", "Average RPE", f"{avg_rpe:.1f}", description="Effort is comfortable; progression possible")
 
-                if (kcal_out > 0).any():
+                if (kcal_out > 0).any() and "calories_kcal" in scoped.columns and "garmin_calories_kcal" in scoped.columns:
                     heavy_days = scoped[scoped["garmin_calories_kcal"] > 600]
-                    if not heavy_days.empty:
+                    if not heavy_days.empty and "calories_kcal" in heavy_days.columns:
                         underfed = heavy_days[heavy_days["calories_kcal"] < heavy_days["garmin_calories_kcal"] - 300]
                         if not underfed.empty:
                             d = underfed.iloc[-1]["date"].date()
