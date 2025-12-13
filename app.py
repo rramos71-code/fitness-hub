@@ -972,20 +972,22 @@ def main():
                 if weekly.empty:
                     st.info("Weekly summaries will appear once you have logged data.")
                 else:
-                    weekly_view = weekly[
-                        [
-                            "week",
-                            "avg_kcal",
-                            "avg_protein",
-                            "avg_steps",
-                            "goal_kcal_delta",
-                            "goal_calorie_compliance",
-                            "goal_protein_compliance",
-                            "goal_steps_compliance",
-                        ]
-                    ].copy()
-                    weekly_view = weekly_view.round(
-                        {
+                    cols = [
+                        "week",
+                        "avg_kcal",
+                        "avg_protein",
+                        "avg_steps",
+                        "goal_kcal_delta",
+                        "goal_calorie_compliance",
+                        "goal_protein_compliance",
+                        "goal_steps_compliance",
+                    ]
+                    existing_cols = [c for c in cols if c in weekly.columns]
+                    if not existing_cols:
+                        st.info("Weekly summaries available, but no metrics to display for this dataset.")
+                    else:
+                        weekly_view = weekly[existing_cols].copy()
+                        round_map = {
                             "avg_kcal": 1,
                             "avg_protein": 1,
                             "avg_steps": 1,
@@ -994,34 +996,34 @@ def main():
                             "goal_protein_compliance": 2,
                             "goal_steps_compliance": 2,
                         }
-                    )
-                    weekly_view.rename(
-                        columns={
-                            "goal_kcal_delta": "kcal delta vs goal",
-                            "goal_calorie_compliance": "calorie goal hit rate",
-                            "goal_protein_compliance": "protein goal hit rate",
-                            "goal_steps_compliance": "steps goal hit rate",
-                        },
-                        inplace=True,
-                    )
-                    st.dataframe(weekly_view, use_container_width=True)
+                        weekly_view = weekly_view.round({k: v for k, v in round_map.items() if k in weekly_view.columns})
+                        weekly_view.rename(
+                            columns={
+                                "goal_kcal_delta": "kcal delta vs goal",
+                                "goal_calorie_compliance": "calorie goal hit rate",
+                                "goal_protein_compliance": "protein goal hit rate",
+                                "goal_steps_compliance": "steps goal hit rate",
+                            },
+                            inplace=True,
+                        )
+                        st.dataframe(weekly_view, use_container_width=True)
 
-                    csv_bytes = weekly_view.to_csv(index=False).encode("utf-8")
-                    st.download_button(
-                        "Download weekly summary (CSV)",
-                        data=csv_bytes,
-                        file_name="weekly_summary.csv",
-                        mime="text/csv",
-                    )
+                        csv_bytes = weekly_view.to_csv(index=False).encode("utf-8")
+                        st.download_button(
+                            "Download weekly summary (CSV)",
+                            data=csv_bytes,
+                            file_name="weekly_summary.csv",
+                            mime="text/csv",
+                        )
 
-                    text_table = weekly_view.to_string(index=False).splitlines()
-                    pdf_bytes = build_text_pdf("Weekly summary", text_table)
-                    st.download_button(
-                        "Download weekly summary (PDF)",
-                        data=pdf_bytes,
-                        file_name="weekly_summary.pdf",
-                        mime="application/pdf",
-                    )
+                        text_table = weekly_view.to_string(index=False).splitlines()
+                        pdf_bytes = build_text_pdf("Weekly summary", text_table)
+                        st.download_button(
+                            "Download weekly summary (PDF)",
+                            data=pdf_bytes,
+                            file_name="weekly_summary.pdf",
+                            mime="application/pdf",
+                        )
 
                 st.subheader("Trends (calories only)")
 
