@@ -605,8 +605,8 @@ def main():
                 st.session_state["garmin_daily_df"] = daily_df_gar
                 st.session_state["garmin_activities_df"] = activities_df
 
-                st.write("Daily")
-                st.dataframe(daily_df_gar.head())
+                st.write("Daily (most recent first)")
+                st.dataframe(daily_df_gar.sort_values("date", ascending=False))
 
                 st.write("Activities")
                 st.dataframe(activities_df.head())
