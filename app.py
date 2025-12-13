@@ -164,17 +164,29 @@ def compute_weekly_with_goals(df: pd.DataFrame) -> pd.DataFrame:
     tmp = df.copy()
     tmp["week_start"] = tmp["date"] - pd.to_timedelta(tmp["date"].dt.weekday, unit="D")
 
-    agg = tmp.groupby("week_start").agg(
-        avg_kcal=("calories_kcal", "mean"),
-        avg_protein=("protein_g", "mean"),
-        avg_steps=("garmin_steps", "mean"),
-        goal_kcal_delta=("goal_calorie_delta", "mean"),
-        goal_calorie_compliance=("goal_calorie_met", "mean"),
-        goal_protein_delta=("goal_protein_delta", "mean"),
-        goal_protein_compliance=("goal_protein_met", "mean"),
-        goal_steps_compliance=("goal_steps_met", "mean"),
-        days_with_data=("date", "count"),
-    )
+    agg_spec = {"days_with_data": ("date", "count")}
+    if "calories_kcal" in tmp.columns:
+        agg_spec["avg_kcal"] = ("calories_kcal", "mean")
+    if "protein_g" in tmp.columns:
+        agg_spec["avg_protein"] = ("protein_g", "mean")
+    if "garmin_steps" in tmp.columns:
+        agg_spec["avg_steps"] = ("garmin_steps", "mean")
+    if "goal_calorie_delta" in tmp.columns:
+        agg_spec["goal_kcal_delta"] = ("goal_calorie_delta", "mean")
+    if "goal_calorie_met" in tmp.columns:
+        agg_spec["goal_calorie_compliance"] = ("goal_calorie_met", "mean")
+    if "goal_protein_delta" in tmp.columns:
+        agg_spec["goal_protein_delta"] = ("goal_protein_delta", "mean")
+    if "goal_protein_met" in tmp.columns:
+        agg_spec["goal_protein_compliance"] = ("goal_protein_met", "mean")
+    if "goal_steps_met" in tmp.columns:
+        agg_spec["goal_steps_compliance"] = ("goal_steps_met", "mean")
+
+    # If we only have the date column, return empty to avoid misleading output.
+    if len(agg_spec) <= 1:
+        return pd.DataFrame()
+
+    agg = tmp.groupby("week_start").agg(**agg_spec)
 
     agg = agg.reset_index().sort_values("week_start")
     agg["week"] = agg["week_start"].dt.strftime("%Y-%m-%d")
