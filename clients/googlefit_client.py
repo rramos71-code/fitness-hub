@@ -70,11 +70,14 @@ class GoogleFitClient:
     def _aggregate_request(self, days_back: int) -> Dict[str, Any]:
         tz = ZoneInfo("Europe/Berlin")
 
-        end_local = datetime.now(tz)
-        start_local = end_local - timedelta(days=days_back)
+        # Align bucket boundaries to local midnights to avoid off-by-one shifts.
+        now_local = datetime.now(tz)
+        start_of_today = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+        start_local = start_of_today - timedelta(days=days_back - 1)
+        end_local = start_of_today + timedelta(days=1)  # include today fully
 
-        end_ms = int(end_local.timestamp() * 1000)
         start_ms = int(start_local.timestamp() * 1000)
+        end_ms = int(end_local.timestamp() * 1000)
 
         body = {
             "aggregateBy": [{"dataTypeName": "com.google.nutrition"}],
