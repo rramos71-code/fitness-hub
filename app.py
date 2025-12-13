@@ -1216,8 +1216,8 @@ def main():
                             d = underfed.iloc[-1]["date"].date()
                             add_card("Energy", "High burn day", f"{d}", description="Burn exceeded intake by >300 kcal")
 
-                weekend = scoped[scoped["date"].dt.weekday >= 5]
-                if not weekend.empty:
+                weekend = scoped[scoped["date"].dt.weekday >= 5] if "date" in scoped.columns else pd.DataFrame()
+                if "calories_kcal" in scoped.columns and not weekend.empty:
                     w_kcal = weekend["calories_kcal"].mean()
                     wd_kcal = scoped[scoped["date"].dt.weekday < 5]["calories_kcal"].mean()
                     delta = w_kcal - wd_kcal
