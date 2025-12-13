@@ -12,6 +12,130 @@ def _format_top_set(weight: float, reps: float) -> str:
     return f"{weight:.0f} x {reps:.0f}"
 
 
+def progression_rules_v1(exercise_df: pd.DataFrame, rep_low: int, rep_high: int, kg_step: float) -> dict:
+    """
+    Given working sets for a single exercise, derive a simple load recommendation.
+    """
+    if exercise_df is None or exercise_df.empty:
+        return {
+            "latest_date": None,
+            "latest_avg_weight_kg": None,
+            "latest_avg_reps": None,
+            "action": "keep",
+            "recommended_weight_kg": None,
+            "reason": "No working sets available.",
+        }
+
+    # Ensure sorted to get latest
+    exercise_df = exercise_df.copy().sort_values("date_day")
+    latest_date = exercise_df["date_day"].max()
+    latest_session = exercise_df[exercise_df["date_day"] == latest_date]
+
+    latest_avg_weight = latest_session["weight_kg"].mean()
+    latest_avg_reps = latest_session["reps"].mean()
+
+    if pd.isna(latest_avg_reps) or pd.isna(latest_avg_weight):
+        return {
+            "latest_date": latest_date,
+            "latest_avg_weight_kg": latest_avg_weight,
+            "latest_avg_reps": latest_avg_reps,
+            "action": "keep",
+            "recommended_weight_kg": latest_avg_weight,
+            "reason": "Insufficient data to determine recommendation.",
+        }
+
+    if latest_avg_reps >= rep_high:
+        action = "increase"
+        recommended = latest_avg_weight + kg_step
+        reason = f"Avg reps {latest_avg_reps:.1f} >= {rep_high}; increase by {kg_step:g} kg."
+    elif latest_avg_reps <= rep_low - 2:
+        action = "decrease"
+        recommended = max(latest_avg_weight - kg_step, 0)
+        reason = f"Avg reps {latest_avg_reps:.1f} <= {rep_low-2}; decrease by {kg_step:g} kg."
+    else:
+        action = "keep"
+        recommended = latest_avg_weight
+        reason = f"Avg reps {latest_avg_reps:.1f} within target; keep load."
+
+    return {
+        "latest_date": latest_date,
+        "latest_avg_weight_kg": latest_avg_weight,
+        "latest_avg_reps": latest_avg_reps,
+        "action": action,
+        "recommended_weight_kg": recommended,
+        "reason": reason,
+    }
+
+
+def build_progression_recommendations(sets_df: pd.DataFrame, goal_type: str = "recomp") -> pd.DataFrame:
+    """
+    Build per-exercise load recommendations based on recent session performance.
+    """
+    if sets_df is None or sets_df.empty:
+        return pd.DataFrame(
+            columns=[
+                "exercise_name",
+                "latest_date",
+                "latest_avg_weight_kg",
+                "latest_avg_reps",
+                "action",
+                "recommended_weight_kg",
+                "target_rep_range",
+                "reason",
+                "confidence",
+            ]
+        )
+
+    goal_map = {
+        "recomp": (6, 10, 2.5),
+        "hypertrophy": (8, 12, 2.5),
+        "strength": (3, 6, 5.0),
+        "maintenance": (5, 10, 0.0),
+    }
+    rep_low, rep_high, kg_step = goal_map.get(goal_type, goal_map["recomp"])
+    target_rep_range = f"{rep_low}-{rep_high}"
+
+    rows = []
+    for ex_name, g in sets_df.groupby("exercise_name"):
+        g = g[g["is_working_set"]]
+        if g.empty:
+            continue
+
+        rec = progression_rules_v1(g, rep_low, rep_high, kg_step)
+
+        # Confidence based on working set count in latest session
+        latest_session = g[g["date_day"] == rec["latest_date"]] if rec["latest_date"] is not None else pd.DataFrame()
+        ws_count = len(latest_session)
+        if ws_count >= 3:
+            conf = 1.0
+        elif ws_count == 2:
+            conf = 0.7
+        elif ws_count == 1:
+            conf = 0.5
+        else:
+            conf = 0.3
+
+        rows.append(
+            {
+                "exercise_name": ex_name,
+                "latest_date": rec["latest_date"],
+                "latest_avg_weight_kg": rec["latest_avg_weight_kg"],
+                "latest_avg_reps": rec["latest_avg_reps"],
+                "action": rec["action"],
+                "recommended_weight_kg": rec["recommended_weight_kg"],
+                "target_rep_range": target_rep_range,
+                "reason": rec["reason"],
+                "confidence": conf,
+            }
+        )
+
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+
+    out = out.sort_values("latest_date", ascending=False).reset_index(drop=True)
+    return out
+
 def build_exercise_library(sets_df: pd.DataFrame, lookback_days: int = 90) -> pd.DataFrame:
     """
     Build per-exercise training summary from canonical Hevy sets.
