@@ -136,6 +136,39 @@ def build_progression_recommendations(sets_df: pd.DataFrame, goal_type: str = "r
     out = out.sort_values("latest_date", ascending=False).reset_index(drop=True)
     return out
 
+
+def build_notifications(progress_df: pd.DataFrame) -> dict[str, list[str]]:
+    """
+    Build notification buckets from progression recommendations.
+
+    Returns:
+        {
+            "increase_now": [...],
+            "hold": [...],
+            "decrease": [...],
+            "low_confidence": [...],
+        }
+    """
+    if progress_df is None or progress_df.empty:
+        return {"increase_now": [], "hold": [], "decrease": [], "low_confidence": []}
+
+    def pick(action: str) -> list[str]:
+        return sorted(progress_df.loc[progress_df["action"] == action, "exercise_name"].dropna().unique().tolist())
+
+    increase_now = pick("increase")
+    hold = pick("keep")
+    decrease = pick("decrease")
+    low_confidence = sorted(
+        progress_df.loc[progress_df["confidence"] < 0.7, "exercise_name"].dropna().unique().tolist()
+    )
+
+    return {
+        "increase_now": increase_now,
+        "hold": hold,
+        "decrease": decrease,
+        "low_confidence": low_confidence,
+    }
+
 def build_exercise_library(sets_df: pd.DataFrame, lookback_days: int = 90) -> pd.DataFrame:
     """
     Build per-exercise training summary from canonical Hevy sets.
