@@ -271,18 +271,22 @@ def ensure_hevy_date_column(df):
 
     df = df.copy()
 
-    if "date" in df.columns:
-        return df
-
     for candidate in [
+        "date",
+        "date_day",
+        "workout_date",
+        "workout_start_time",
+        "startTime",
         "performed_at",
-        "workout_start",
         "start_time",
+        "performedAt",
+        "workout_start",
+        "createdAt",
         "created_at",
         "timestamp",
     ]:
         if candidate in df.columns:
-            df["date"] = pd.to_datetime(df[candidate]).dt.date
+            df["date"] = pd.to_datetime(df[candidate])
             return df
 
     raise ValueError(
