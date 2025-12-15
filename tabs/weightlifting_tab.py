@@ -6,6 +6,7 @@ from utils.hevy_processing import (
     build_exercise_library,
     build_exercise_progression,
     build_progression_recommendations,
+    ensure_hevy_date_column
 )
 
 def get_hevy_sets_from_session() -> pd.DataFrame | None:
@@ -30,6 +31,7 @@ def render_weightlifting_tab():
             try:
                 client = HevyClient()
                 workouts_df, sets_df = client.sync_workouts()
+                sets_df = ensure_hevy_date_column(sets_df)
 
                 # Persist for other tabs
                 st.session_state["hevy_workouts_df"] = workouts_df

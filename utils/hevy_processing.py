@@ -263,3 +263,29 @@ def build_progression_recommendations(
         ["recommendation", "confidence"],
         ascending=[True, False],
     )
+
+
+def ensure_hevy_date_column(df):
+    if df is None or df.empty:
+        return df
+
+    df = df.copy()
+
+    if "date" in df.columns:
+        return df
+
+    for candidate in [
+        "performed_at",
+        "workout_start",
+        "start_time",
+        "created_at",
+        "timestamp",
+    ]:
+        if candidate in df.columns:
+            df["date"] = pd.to_datetime(df[candidate]).dt.date
+            return df
+
+    raise ValueError(
+        "Hevy sets dataframe has no recognizable datetime column "
+        "to derive 'date'."
+    )
