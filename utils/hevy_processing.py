@@ -79,6 +79,34 @@ def get_hevy_sets_from_session() -> pd.DataFrame:
 
     return sets_df
 
+def _normalize_set_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Harmonize common Hevy set column variants so downstream analytics
+    are resilient to SDK / export changes.
+    """
+    df = df.copy()
+
+    if "weight_kg" not in df.columns:
+        for cand in ["weight", "weightKg", "kg"]:
+            if cand in df.columns:
+                df["weight_kg"] = df[cand]
+                break
+
+    if "reps" not in df.columns:
+        for cand in ["rep", "repetitions", "reps_count"]:
+            if cand in df.columns:
+                df["reps"] = df[cand]
+                break
+
+    if "isWarmup" not in df.columns:
+        for cand in ["is_warmup", "warmup", "is_warmup_set"]:
+            if cand in df.columns:
+                df["isWarmup"] = df[cand]
+                break
+
+    return df
+
+
 def build_exercise_library(
     sets_df,
     lookback_days: int = 90,
@@ -89,9 +117,20 @@ def build_exercise_library(
     """
 
     if sets_df is None or sets_df.empty:
-        return None
+        return pd.DataFrame(
+            columns=[
+                "exercise_name",
+                "sessions",
+                "sets",
+                "avg_weight",
+                "max_weight",
+                "avg_reps",
+                "total_volume",
+                "last_seen",
+            ]
+        )
 
-    df = sets_df.copy()
+    df = _normalize_set_columns(sets_df)
 
     # Normalize date
     df["date"] = pd.to_datetime(df["date"])
@@ -105,7 +144,18 @@ def build_exercise_library(
     # Required columns guard
     required = {"exercise_name", "weight_kg", "reps"}
     if not required.issubset(df.columns):
-        return None
+        return pd.DataFrame(
+            columns=[
+                "exercise_name",
+                "sessions",
+                "sets",
+                "avg_weight",
+                "max_weight",
+                "avg_reps",
+                "total_volume",
+                "last_seen",
+            ]
+        )
 
     df["volume"] = df["weight_kg"].fillna(0) * df["reps"].fillna(0)
 
@@ -137,9 +187,20 @@ def build_exercise_progression(
     """
 
     if sets_df is None or sets_df.empty:
-        return None
+        return pd.DataFrame(
+            columns=[
+                "exercise_name",
+                "sessions",
+                "start_weight",
+                "current_weight",
+                "max_weight",
+                "weight_change",
+                "volume_change_pct",
+                "last_session",
+            ]
+        )
 
-    df = sets_df.copy()
+    df = _normalize_set_columns(sets_df)
     df["date"] = pd.to_datetime(df["date"])
 
     cutoff = df["date"].max() - pd.Timedelta(days=lookback_days)
@@ -150,7 +211,18 @@ def build_exercise_progression(
 
     required = {"exercise_name", "weight_kg", "reps", "date"}
     if not required.issubset(df.columns):
-        return None
+        return pd.DataFrame(
+            columns=[
+                "exercise_name",
+                "sessions",
+                "start_weight",
+                "current_weight",
+                "max_weight",
+                "weight_change",
+                "volume_change_pct",
+                "last_session",
+            ]
+        )
 
     df["volume"] = df["weight_kg"].fillna(0) * df["reps"].fillna(0)
 
@@ -195,6 +267,20 @@ def build_exercise_progression(
             }
         )
 
+    if not progression_rows:
+        return pd.DataFrame(
+            columns=[
+                "exercise_name",
+                "sessions",
+                "start_weight",
+                "current_weight",
+                "max_weight",
+                "weight_change",
+                "volume_change_pct",
+                "last_session",
+            ]
+        )
+
     return pd.DataFrame(progression_rows).sort_values(
         ["weight_change", "volume_change_pct"],
         ascending=False,
@@ -212,7 +298,11 @@ def build_progression_recommendations(
     based on recent progression trends.
     """
 
-    if progression_df is None or progression_df.empty:
+    if (
+        progression_df is None
+        or progression_df.empty
+        or "weight_change" not in progression_df.columns
+    ):
         return None
 
     rows = []
