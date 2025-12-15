@@ -125,3 +125,77 @@ def build_exercise_library(
     )
 
     return exercise_lib
+
+def build_exercise_progression(
+    sets_df,
+    lookback_days: int = 90,
+    include_warmups: bool = False,
+):
+    """
+    Build per-exercise progression metrics from Hevy sets.
+    Used to decide load increases / stalls / deloads.
+    """
+
+    if sets_df is None or sets_df.empty:
+        return None
+
+    df = sets_df.copy()
+    df["date"] = pd.to_datetime(df["date"])
+
+    cutoff = df["date"].max() - pd.Timedelta(days=lookback_days)
+    df = df[df["date"] >= cutoff]
+
+    if not include_warmups and "isWarmup" in df.columns:
+        df = df[~df["isWarmup"]]
+
+    required = {"exercise_name", "weight_kg", "reps", "date"}
+    if not required.issubset(df.columns):
+        return None
+
+    df["volume"] = df["weight_kg"].fillna(0) * df["reps"].fillna(0)
+
+    # Session-level aggregation
+    session = (
+        df.groupby(["exercise_name", "date"])
+        .agg(
+            avg_weight=("weight_kg", "mean"),
+            max_weight=("weight_kg", "max"),
+            total_reps=("reps", "sum"),
+            total_volume=("volume", "sum"),
+        )
+        .reset_index()
+        .sort_values(["exercise_name", "date"])
+    )
+
+    progression_rows = []
+
+    for exercise, g in session.groupby("exercise_name"):
+        g = g.sort_values("date")
+
+        if len(g) < 2:
+            continue
+
+        first = g.iloc[0]
+        last = g.iloc[-1]
+
+        progression_rows.append(
+            {
+                "exercise_name": exercise,
+                "sessions": len(g),
+                "start_weight": first["avg_weight"],
+                "current_weight": last["avg_weight"],
+                "max_weight": g["max_weight"].max(),
+                "weight_change": last["avg_weight"] - first["avg_weight"],
+                "volume_change_pct": (
+                    (last["total_volume"] - first["total_volume"]) / first["total_volume"]
+                    if first["total_volume"] > 0
+                    else 0
+                ),
+                "last_session": last["date"],
+            }
+        )
+
+    return pd.DataFrame(progression_rows).sort_values(
+        ["weight_change", "volume_change_pct"],
+        ascending=False,
+    )
