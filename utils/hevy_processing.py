@@ -199,3 +199,67 @@ def build_exercise_progression(
         ["weight_change", "volume_change_pct"],
         ascending=False,
     )
+
+def build_progression_recommendations(
+    progression_df,
+    *,
+    min_sessions: int = 3,
+    min_weight_increase: float = 1.25,
+    deload_threshold: float = -2.5,
+):
+    """
+    Generate simple load recommendations per exercise
+    based on recent progression trends.
+    """
+
+    if progression_df is None or progression_df.empty:
+        return None
+
+    rows = []
+
+    for _, row in progression_df.iterrows():
+        exercise = row["exercise_name"]
+        sessions = row["sessions"]
+        weight_change = row["weight_change"]
+        volume_change = row["volume_change_pct"]
+
+        recommendation = "hold"
+        reason = "Insufficient signal"
+        confidence = "low"
+
+        if sessions >= min_sessions:
+            confidence = "medium"
+
+            if weight_change >= min_weight_increase:
+                recommendation = "increase"
+                reason = "Consistent load progression observed"
+                confidence = "high"
+
+            elif weight_change <= deload_threshold:
+                recommendation = "deload"
+                reason = "Performance regression detected"
+
+            elif volume_change > 0.15:
+                recommendation = "increase"
+                reason = "Volume increasing without load increase"
+
+            else:
+                recommendation = "hold"
+                reason = "Stable performance"
+
+        rows.append(
+            {
+                "exercise_name": exercise,
+                "recommendation": recommendation,
+                "confidence": confidence,
+                "sessions_observed": sessions,
+                "weight_change": round(weight_change, 2),
+                "volume_change_pct": round(volume_change * 100, 1),
+                "reason": reason,
+            }
+        )
+
+    return pd.DataFrame(rows).sort_values(
+        ["recommendation", "confidence"],
+        ascending=[True, False],
+    )
