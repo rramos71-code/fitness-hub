@@ -596,7 +596,9 @@ def main():
         if st.button("Sync Hevy workouts"):
             try:
                 workouts_df, sets_df = hevy_client.sync_workouts()
+                st.session_state["hevy_workouts_df"] = workouts_df
                 st.session_state["hevy_sets_df"] = sets_df
+
 
                 st.success(f"Hevy connection OK, {len(workouts_df)} workouts retrieved")
                 st.subheader("Hevy sets (sample)")

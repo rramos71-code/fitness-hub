@@ -1,75 +1,62 @@
 import streamlit as st
 import pandas as pd
 
-from utils.hevy_processing import get_hevy_sets_from_session
-from analytics.weightlifting import (
+from clients.hevy_client import HevyClient
+from utils.hevy_processing import (
     build_exercise_library,
+    build_exercise_progression,
     build_progression_recommendations,
-    build_notifications,
 )
 
+def get_hevy_sets_from_session() -> pd.DataFrame | None:
+    df = st.session_state.get("hevy_sets_df")
+    if df is None or df.empty:
+        return None
+    return df
 
-def render_weightlifting_tab() -> None:
-    """
-    Render the weightlifting tab using Hevy sets already present in session state.
-    """
+def render_weightlifting_tab():
     st.header("Weightlifting")
 
-    with st.expander("Controls", expanded=False):
-        lookback_days = st.number_input("Lookback days (library)", min_value=14, max_value=365, value=90, step=7)
-        show_warmups = st.checkbox("Include warmups", value=False)
+    with st.expander("Controls", expanded=True):
+        lookback_days = st.number_input(
+            "Lookback days (library)", min_value=7, max_value=365, value=90, step=7
+        )
+        include_warmups = st.checkbox("Include warmups", value=False)
 
-    sets_df = get_hevy_sets_from_session()
-    if sets_df is None or sets_df.empty:
-        st.info("Sync Hevy workouts first.")
-        return
+    # --- NEW: allow syncing here ---
+    c1, c2 = st.columns([1, 2])
+    with c1:
+        if st.button("Sync Hevy now", use_container_width=True):
+            try:
+                client = HevyClient()
+                workouts_df, sets_df = client.sync_workouts()
 
-    if not show_warmups:
-        sets_df = sets_df[sets_df["is_working_set"]]
+                # Persist for other tabs
+                st.session_state["hevy_workouts_df"] = workouts_df
+                st.session_state["hevy_sets_df"] = sets_df
 
-    if sets_df is None or sets_df.empty:
-        st.info("No working sets yet. Try including warmups or sync again.")
-        return
+                st.success(f"Hevy synced: {len(workouts_df)} workouts, {len(sets_df)} sets")
+            except Exception as e:
+                st.error(f"Hevy sync failed: {e}")
 
-    # Summary metrics
-    today = pd.Timestamp.utcnow().date()
-    seven_start = today - pd.Timedelta(days=7)
-    twenty8_start = today - pd.Timedelta(days=28)
+    with c2:
+        sets_df = get_hevy_sets_from_session()
+        if sets_df is None:
+            st.info("Sync Hevy workouts first.")
+            with st.expander("Debug: session keys", expanded=False):
+                st.write(sorted(list(st.session_state.keys())))
+            return
+        st.caption(f"Loaded Hevy sets from session: {len(sets_df)} rows")
 
-    recent7 = sets_df[sets_df["date_day"] >= seven_start]
-    recent28 = sets_df[sets_df["date_day"] >= twenty8_start]
-    recent7_volume = (recent7["weight_kg"] * recent7["reps"]).sum()
-    recent28_volume = (recent28["weight_kg"] * recent28["reps"]).sum()
-
-    sessions_7d = recent7["date_day"].nunique()
-    exercises_count = sets_df["exercise_name"].nunique()
-
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Sessions (7d)", f"{sessions_7d}")
-    c2.metric("Volume 7d (kg)", f"{recent7_volume:,.0f}")
-    c3.metric("Volume 28d (kg)", f"{recent28_volume:,.0f}")
-    c4.metric("Exercises", f"{exercises_count}")
-
-    # Build tables
-    library_df = build_exercise_library(sets_df, lookback_days=lookback_days)
-    goal_type = st.session_state.get("goal_config", {}).get("goal_type", "recomp")
-    progress_df = build_progression_recommendations(sets_df, goal_type=goal_type)
-    notifications = build_notifications(progress_df)
-
-    st.subheader("Notifications")
-    if notifications["increase_now"]:
-        st.success(f"Increase now: {', '.join(notifications['increase_now'])}")
-    if notifications["hold"]:
-        st.info(f"Hold: {', '.join(notifications['hold'])}")
-    if notifications["decrease"]:
-        st.warning(f"Decrease: {', '.join(notifications['decrease'])}")
-    if notifications["low_confidence"]:
-        st.warning(f"Low confidence: {', '.join(notifications['low_confidence'])}")
-    if not any(notifications.values()):
-        st.info("No recommendations yet.")
-
+    # --- Existing analytics ---
+    lib_df = build_exercise_library(sets_df, lookback_days=lookback_days, include_warmups=include_warmups)
     st.subheader("Exercise library")
-    st.dataframe(library_df, use_container_width=True)
+    st.dataframe(lib_df, use_container_width=True)
 
-    st.subheader("Progression recommendations")
-    st.dataframe(progress_df, use_container_width=True)
+    prog_df = build_exercise_progression(sets_df, lookback_days=lookback_days, include_warmups=include_warmups)
+    st.subheader("Progression signals")
+    st.dataframe(prog_df, use_container_width=True)
+
+    recs_df = build_progression_recommendations(prog_df)
+    st.subheader("Recommendations")
+    st.dataframe(recs_df, use_container_width=True)
