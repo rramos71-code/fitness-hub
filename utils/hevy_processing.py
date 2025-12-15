@@ -144,3 +144,50 @@ def build_exercise_library(sets_df: pd.DataFrame, include_warmups: bool = False)
 
     out = out.sort_values("total_sets", ascending=False).reset_index(drop=True)
     return out
+
+def build_exercise_library(
+    sets_df,
+    lookback_days: int = 90,
+    include_warmups: bool = False,
+):
+    """
+    Build a per-exercise summary table from Hevy sets.
+    """
+
+    if sets_df is None or sets_df.empty:
+        return None
+
+    df = sets_df.copy()
+
+    # Normalize date
+    df["date"] = pd.to_datetime(df["date"])
+    cutoff = df["date"].max() - pd.Timedelta(days=lookback_days)
+    df = df[df["date"] >= cutoff]
+
+    # Optional warmup filter
+    if not include_warmups and "isWarmup" in df.columns:
+        df = df[~df["isWarmup"]]
+
+    # Required columns guard
+    required = {"exercise_name", "weight_kg", "reps"}
+    if not required.issubset(df.columns):
+        return None
+
+    df["volume"] = df["weight_kg"].fillna(0) * df["reps"].fillna(0)
+
+    exercise_lib = (
+        df.groupby("exercise_name")
+        .agg(
+            sessions=("date", "nunique"),
+            sets=("reps", "count"),
+            avg_weight=("weight_kg", "mean"),
+            max_weight=("weight_kg", "max"),
+            avg_reps=("reps", "mean"),
+            total_volume=("volume", "sum"),
+            last_seen=("date", "max"),
+        )
+        .reset_index()
+        .sort_values("total_volume", ascending=False)
+    )
+
+    return exercise_lib
