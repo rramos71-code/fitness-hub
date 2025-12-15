@@ -383,3 +383,21 @@ def ensure_hevy_date_column(df):
         "Hevy sets dataframe has no recognizable datetime column "
         "to derive 'date'."
     )
+
+
+def standardize_hevy_sets(
+    df: pd.DataFrame, *, tz_name: str = "Europe/Berlin"
+) -> pd.DataFrame:
+    """
+    Prepare Hevy sets for downstream analytics:
+      - ensure a 'date' column exists and is datetime
+      - add date_local / date_day
+      - normalize common set field names (weight_kg, reps, isWarmup)
+    """
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    df = ensure_hevy_date_column(df)
+    df = _standardize_dates(df, tz_name=tz_name)
+    df = _normalize_set_columns(df)
+    return df

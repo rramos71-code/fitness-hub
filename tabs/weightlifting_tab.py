@@ -6,13 +6,34 @@ from utils.hevy_processing import (
     build_exercise_library,
     build_exercise_progression,
     build_progression_recommendations,
-    ensure_hevy_date_column
+    ensure_hevy_date_column,
+    standardize_hevy_sets,
 )
 
+
 def get_hevy_sets_from_session() -> pd.DataFrame | None:
+    """
+    Pull sets from session and normalize schema/date columns
+    so downstream analytics never KeyError on 'date'.
+    """
     df = st.session_state.get("hevy_sets_df")
-    if df is None or df.empty:
+    if df is None or getattr(df, "empty", True):
         return None
+
+    try:
+        df = standardize_hevy_sets(df)
+    except Exception as exc:
+        # last resort: try simpler date ensure to avoid hard failure
+        try:
+            df = ensure_hevy_date_column(df)
+            df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        except Exception:
+            st.error(f"Hevy sets missing required date fields: {exc}")
+            return None
+
+    if df.empty or "date" not in df.columns:
+        return None
+
     return df
 
 def render_weightlifting_tab():
@@ -31,7 +52,7 @@ def render_weightlifting_tab():
             try:
                 client = HevyClient()
                 workouts_df, sets_df = client.sync_workouts()
-                sets_df = ensure_hevy_date_column(sets_df)
+                sets_df = standardize_hevy_sets(sets_df)
 
                 # Persist for other tabs
                 st.session_state["hevy_workouts_df"] = workouts_df
@@ -51,11 +72,15 @@ def render_weightlifting_tab():
         st.caption(f"Loaded Hevy sets from session: {len(sets_df)} rows")
 
     # --- Existing analytics ---
-    lib_df = build_exercise_library(sets_df, lookback_days=lookback_days, include_warmups=include_warmups)
+    lib_df = build_exercise_library(
+        sets_df, lookback_days=lookback_days, include_warmups=include_warmups
+    )
     st.subheader("Exercise library")
     st.dataframe(lib_df, use_container_width=True)
 
-    prog_df = build_exercise_progression(sets_df, lookback_days=lookback_days, include_warmups=include_warmups)
+    prog_df = build_exercise_progression(
+        sets_df, lookback_days=lookback_days, include_warmups=include_warmups
+    )
     st.subheader("Progression signals")
     st.dataframe(prog_df, use_container_width=True)
 
