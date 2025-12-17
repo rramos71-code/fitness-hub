@@ -11,7 +11,7 @@ from clients.hevy_client import HevyClient
 from clients.garmin_client import GarminClient
 from clients.googlefit_client import GoogleFitClient
 from google.auth import exceptions as google_auth_exceptions
-from utils.hevy_processing import standardize_hevy_sets
+from utils.hevy_processing import normalize_hevy_sets
 
 # =========================================================
 #  Column mapping from unified daily_df
@@ -597,7 +597,7 @@ def main():
         if st.button("Sync Hevy workouts"):
             try:
                 workouts_df, sets_df = hevy_client.sync_workouts()
-                sets_df = standardize_hevy_sets(sets_df)
+                sets_df = normalize_hevy_sets(sets_df)
                 st.session_state["hevy_workouts_df"] = workouts_df
                 st.session_state["hevy_sets_df"] = sets_df
 
