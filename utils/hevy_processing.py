@@ -1,403 +1,126 @@
-from __future__ import annotations
-
-from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
-
+# utils/hevy_processing.py
 import pandas as pd
-import streamlit as st
+from datetime import timedelta
+from .hevy_schema import REQUIRED_SET_COLS, ProgressionConfig
 
+DATE_CANDIDATES = [
+    "date", "workout_date", "start_time", "startTime", "performed_at",
+    "performedAt", "workout.start_time", "workoutStart", "timestamp",
+]
 
-def _standardize_dates(df: pd.DataFrame, tz_name: str = "Europe/Berlin") -> pd.DataFrame:
+EXERCISE_CANDIDATES = [
+    "exercise_name", "exercise", "name", "exerciseName", "movement",
+]
+
+WEIGHT_CANDIDATES = ["weight_kg", "weight", "kg", "load", "weightKg"]
+REPS_CANDIDATES = ["reps", "rep_count", "repetitions", "repsCount"]
+WARMUP_CANDIDATES = ["is_warmup", "isWarmup", "warmup"]
+
+def _pick_first(df: pd.DataFrame, candidates: list[str]) -> str | None:
+    for c in candidates:
+        if c in df.columns:
+            return c
+    return None
+
+def normalize_hevy_sets(sets_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Ensure df has:
-      - date (datetime)
-      - date_local (datetime localized/converted)
-      - date_day (python date)
+    Return a normalized sets DF with REQUIRED_SET_COLS present.
+    This is the only place allowed to do column mapping.
     """
-    if df is None or df.empty:
-        return pd.DataFrame()
+    if sets_df is None or sets_df.empty:
+        return pd.DataFrame(columns=REQUIRED_SET_COLS)
 
-    df = df.copy()
-    tz = ZoneInfo(tz_name)
+    df = sets_df.copy()
 
-    # IMPORTANT: include 'workout_date' because Hevy sync writes that column
-    date_col = None
-    for cand in [
-        "date",
-        "date_day",
-        "workout_date",
-        "workout_start_time",
-        "workout_start",
-        "startTime",
-        "start_time",
-        "performed_at",
-        "performedAt",
-        "createdAt",
-        "loggedAt",
-    ]:
-        if cand in df.columns:
-            date_col = cand
-            break
+    date_col = _pick_first(df, DATE_CANDIDATES)
+    ex_col = _pick_first(df, EXERCISE_CANDIDATES)
+    w_col = _pick_first(df, WEIGHT_CANDIDATES)
+    r_col = _pick_first(df, REPS_CANDIDATES)
+    wu_col = _pick_first(df, WARMUP_CANDIDATES)
 
-    if not date_col:
-        df["date"] = pd.NaT
-        df["date_local"] = pd.NaT
-        df["date_day"] = pd.NaT
-        return df
-
-    df["date"] = pd.to_datetime(df[date_col], errors="coerce")
-
-    if getattr(df["date"].dt, "tz", None) is None:
-        df["date_local"] = df["date"].dt.tz_localize(
-            tz, nonexistent="shift_forward", ambiguous="NaT"
-        )
+    # date
+    if date_col is None:
+        df["date_dt"] = pd.NaT
     else:
-        df["date_local"] = df["date"].dt.tz_convert(tz)
+        df["date_dt"] = pd.to_datetime(df[date_col], errors="coerce", utc=True).dt.tz_convert(None)
 
-    df["date_day"] = df["date_local"].dt.date
-    return df
+    df["date"] = df["date_dt"].dt.date
 
+    # exercise name
+    df["exercise_name"] = df[ex_col].astype(str) if ex_col else None
 
-def get_hevy_sets_from_session() -> pd.DataFrame:
-    """
-    Reads Hevy sets from session_state and applies standardization + lookback filtering.
-    Expects session_state['hevy_sets_df'] set by the Hevy sync button.
-    """
-    sets_df = st.session_state.get("hevy_sets_df")
-    if sets_df is None or getattr(sets_df, "empty", True):
-        return pd.DataFrame()
+    # weight and reps
+    df["weight_kg"] = pd.to_numeric(df[w_col], errors="coerce") if w_col else 0.0
+    df["reps"] = pd.to_numeric(df[r_col], errors="coerce") if r_col else 0
 
-    sets_df = _standardize_dates(sets_df)
+    # warmup
+    if wu_col:
+        df["is_warmup"] = df[wu_col].astype(bool)
+    else:
+        df["is_warmup"] = False
 
-    lookback_days = int(st.session_state.get("hevy_lookback_days", 90))
-    if "date_day" in sets_df.columns and sets_df["date_day"].notna().any():
-        cutoff = (
-            datetime.now(ZoneInfo("Europe/Berlin")).date()
-            - timedelta(days=lookback_days)
-        )
-        sets_df = sets_df[sets_df["date_day"] >= cutoff].copy()
-
-    return sets_df
-
-def _normalize_set_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Harmonize common Hevy set column variants so downstream analytics
-    are resilient to SDK / export changes.
-    """
-    df = df.copy()
-
-    if "weight_kg" not in df.columns:
-        for cand in ["weight", "weightKg", "kg"]:
-            if cand in df.columns:
-                df["weight_kg"] = df[cand]
-                break
-
-    if "reps" not in df.columns:
-        for cand in ["rep", "repetitions", "reps_count"]:
-            if cand in df.columns:
-                df["reps"] = df[cand]
-                break
-
-    if "isWarmup" not in df.columns:
-        for cand in ["is_warmup", "warmup", "is_warmup_set"]:
-            if cand in df.columns:
-                df["isWarmup"] = df[cand]
-                break
+    # clean
+    df = df.dropna(subset=["date", "exercise_name"])
+    df = df[df["exercise_name"].str.len() > 0]
+    df["reps"] = df["reps"].fillna(0).astype(int)
+    df["weight_kg"] = df["weight_kg"].fillna(0.0).astype(float)
 
     return df
 
-
-def build_exercise_library(
-    sets_df,
-    lookback_days: int = 90,
-    include_warmups: bool = False,
-):
+def build_exercise_library(sets_norm: pd.DataFrame, cfg: ProgressionConfig) -> pd.DataFrame:
     """
-    Build a per-exercise summary table from Hevy sets.
+    Aggregate per exercise: sessions, sets, avg/max weight, avg reps, total volume, last seen.
     """
+    if sets_norm is None or sets_norm.empty:
+        return pd.DataFrame(columns=[
+            "exercise_name","sessions","sets","avg_weight","max_weight","avg_reps","total_volume","last_seen"
+        ])
 
-    if sets_df is None or sets_df.empty:
-        return pd.DataFrame(
-            columns=[
-                "exercise_name",
-                "sessions",
-                "sets",
-                "avg_weight",
-                "max_weight",
-                "avg_reps",
-                "total_volume",
-                "last_seen",
-            ]
-        )
+    df = sets_norm.copy()
+    if not cfg.include_warmups:
+        df = df[~df["is_warmup"]]
 
-    df = _normalize_set_columns(sets_df)
+    cutoff = df["date_dt"].max() - timedelta(days=cfg.lookback_days - 1)
+    df = df[df["date_dt"] >= cutoff]
 
-    # Normalize date
-    df["date"] = pd.to_datetime(df["date"])
-    cutoff = df["date"].max() - pd.Timedelta(days=lookback_days)
-    df = df[df["date"] >= cutoff]
+    df["volume"] = df["weight_kg"] * df["reps"]
 
-    # Optional warmup filter
-    if not include_warmups and "isWarmup" in df.columns:
-        df = df[~df["isWarmup"]]
-
-    # Required columns guard
-    required = {"exercise_name", "weight_kg", "reps"}
-    if not required.issubset(df.columns):
-        return pd.DataFrame(
-            columns=[
-                "exercise_name",
-                "sessions",
-                "sets",
-                "avg_weight",
-                "max_weight",
-                "avg_reps",
-                "total_volume",
-                "last_seen",
-            ]
-        )
-
-    df["volume"] = df["weight_kg"].fillna(0) * df["reps"].fillna(0)
-
-    exercise_lib = (
-        df.groupby("exercise_name")
-        .agg(
-            sessions=("date", "nunique"),
-            sets=("reps", "count"),
-            avg_weight=("weight_kg", "mean"),
-            max_weight=("weight_kg", "max"),
-            avg_reps=("reps", "mean"),
-            total_volume=("volume", "sum"),
-            last_seen=("date", "max"),
-        )
-        .reset_index()
-        .sort_values("total_volume", ascending=False)
+    out = (
+        df.groupby("exercise_name", as_index=False)
+          .agg(
+              sessions=("date", "nunique"),
+              sets=("reps", "count"),
+              avg_weight=("weight_kg", "mean"),
+              max_weight=("weight_kg", "max"),
+              avg_reps=("reps", "mean"),
+              total_volume=("volume", "sum"),
+              last_seen=("date", "max"),
+          )
+          .sort_values(["sessions","total_volume"], ascending=False)
     )
 
-    return exercise_lib
+    return out
 
-def build_exercise_progression(
-    sets_df,
-    lookback_days: int = 90,
-    include_warmups: bool = False,
-):
+def build_exercise_progression(sets_norm: pd.DataFrame, cfg: ProgressionConfig) -> pd.DataFrame:
     """
-    Build per-exercise progression metrics from Hevy sets.
-    Used to decide load increases / stalls / deloads.
+    Compute start/current/top weight, and volume deltas across the lookback.
     """
+    # TODO implement:
+    # - sessionize by date + exercise
+    # - compute per session top set weight and total volume
+    # - compare earliest vs latest in window
+    return pd.DataFrame(columns=[
+        "exercise_name","sessions","start_weight","current_weight","max_weight","weight_change","volume_change","trend"
+    ])
 
-    if sets_df is None or sets_df.empty:
-        return pd.DataFrame(
-            columns=[
-                "exercise_name",
-                "sessions",
-                "start_weight",
-                "current_weight",
-                "max_weight",
-                "weight_change",
-                "volume_change_pct",
-                "last_session",
-            ]
-        )
-
-    df = _normalize_set_columns(sets_df)
-    df["date"] = pd.to_datetime(df["date"])
-
-    cutoff = df["date"].max() - pd.Timedelta(days=lookback_days)
-    df = df[df["date"] >= cutoff]
-
-    if not include_warmups and "isWarmup" in df.columns:
-        df = df[~df["isWarmup"]]
-
-    required = {"exercise_name", "weight_kg", "reps", "date"}
-    if not required.issubset(df.columns):
-        return pd.DataFrame(
-            columns=[
-                "exercise_name",
-                "sessions",
-                "start_weight",
-                "current_weight",
-                "max_weight",
-                "weight_change",
-                "volume_change_pct",
-                "last_session",
-            ]
-        )
-
-    df["volume"] = df["weight_kg"].fillna(0) * df["reps"].fillna(0)
-
-    # Session-level aggregation
-    session = (
-        df.groupby(["exercise_name", "date"])
-        .agg(
-            avg_weight=("weight_kg", "mean"),
-            max_weight=("weight_kg", "max"),
-            total_reps=("reps", "sum"),
-            total_volume=("volume", "sum"),
-        )
-        .reset_index()
-        .sort_values(["exercise_name", "date"])
-    )
-
-    progression_rows = []
-
-    for exercise, g in session.groupby("exercise_name"):
-        g = g.sort_values("date")
-
-        if len(g) < 2:
-            continue
-
-        first = g.iloc[0]
-        last = g.iloc[-1]
-
-        progression_rows.append(
-            {
-                "exercise_name": exercise,
-                "sessions": len(g),
-                "start_weight": first["avg_weight"],
-                "current_weight": last["avg_weight"],
-                "max_weight": g["max_weight"].max(),
-                "weight_change": last["avg_weight"] - first["avg_weight"],
-                "volume_change_pct": (
-                    (last["total_volume"] - first["total_volume"]) / first["total_volume"]
-                    if first["total_volume"] > 0
-                    else 0
-                ),
-                "last_session": last["date"],
-            }
-        )
-
-    if not progression_rows:
-        return pd.DataFrame(
-            columns=[
-                "exercise_name",
-                "sessions",
-                "start_weight",
-                "current_weight",
-                "max_weight",
-                "weight_change",
-                "volume_change_pct",
-                "last_session",
-            ]
-        )
-
-    return pd.DataFrame(progression_rows).sort_values(
-        ["weight_change", "volume_change_pct"],
-        ascending=False,
-    )
-
-def build_progression_recommendations(
-    progression_df,
-    *,
-    min_sessions: int = 3,
-    min_weight_increase: float = 1.25,
-    deload_threshold: float = -2.5,
-):
+def build_progression_recommendations(prog_df: pd.DataFrame, cfg: ProgressionConfig) -> pd.DataFrame:
     """
-    Generate simple load recommendations per exercise
-    based on recent progression trends.
+    Rule-based suggestions based on progression signals.
     """
-
-    if (
-        progression_df is None
-        or progression_df.empty
-        or "weight_change" not in progression_df.columns
-    ):
-        return None
-
-    rows = []
-
-    for _, row in progression_df.iterrows():
-        exercise = row["exercise_name"]
-        sessions = row["sessions"]
-        weight_change = row["weight_change"]
-        volume_change = row["volume_change_pct"]
-
-        recommendation = "hold"
-        reason = "Insufficient signal"
-        confidence = "low"
-
-        if sessions >= min_sessions:
-            confidence = "medium"
-
-            if weight_change >= min_weight_increase:
-                recommendation = "increase"
-                reason = "Consistent load progression observed"
-                confidence = "high"
-
-            elif weight_change <= deload_threshold:
-                recommendation = "deload"
-                reason = "Performance regression detected"
-
-            elif volume_change > 0.15:
-                recommendation = "increase"
-                reason = "Volume increasing without load increase"
-
-            else:
-                recommendation = "hold"
-                reason = "Stable performance"
-
-        rows.append(
-            {
-                "exercise_name": exercise,
-                "recommendation": recommendation,
-                "confidence": confidence,
-                "sessions_observed": sessions,
-                "weight_change": round(weight_change, 2),
-                "volume_change_pct": round(volume_change * 100, 1),
-                "reason": reason,
-            }
-        )
-
-    return pd.DataFrame(rows).sort_values(
-        ["recommendation", "confidence"],
-        ascending=[True, False],
-    )
-
-
-def ensure_hevy_date_column(df):
-    if df is None or df.empty:
-        return df
-
-    df = df.copy()
-
-    for candidate in [
-        "date",
-        "date_day",
-        "workout_date",
-        "workout_start_time",
-        "startTime",
-        "performed_at",
-        "start_time",
-        "performedAt",
-        "workout_start",
-        "createdAt",
-        "created_at",
-        "timestamp",
-    ]:
-        if candidate in df.columns:
-            df["date"] = pd.to_datetime(df[candidate])
-            return df
-
-    raise ValueError(
-        "Hevy sets dataframe has no recognizable datetime column "
-        "to derive 'date'."
-    )
-
-
-def standardize_hevy_sets(
-    df: pd.DataFrame, *, tz_name: str = "Europe/Berlin"
-) -> pd.DataFrame:
-    """
-    Prepare Hevy sets for downstream analytics:
-      - ensure a 'date' column exists and is datetime
-      - add date_local / date_day
-      - normalize common set field names (weight_kg, reps, isWarmup)
-    """
-    if df is None or df.empty:
-        return pd.DataFrame()
-
-    df = ensure_hevy_date_column(df)
-    df = _standardize_dates(df, tz_name=tz_name)
-    df = _normalize_set_columns(df)
-    return df
+    # TODO implement:
+    # - if progressing: consider small increase if reps near ceiling
+    # - if plateau: add reps or sets, or microload
+    # - if regressing: deload
+    return pd.DataFrame(columns=[
+        "exercise_name","recommendation","next_weight_kg","target_reps","rationale"
+    ])

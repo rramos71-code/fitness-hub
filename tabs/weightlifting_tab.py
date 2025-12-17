@@ -1,89 +1,59 @@
+# tabs/weightlifting_tab.py
 import streamlit as st
 import pandas as pd
-
-from clients.hevy_client import HevyClient
 from utils.hevy_processing import (
-    build_exercise_library,
-    build_exercise_progression,
-    build_progression_recommendations,
-    ensure_hevy_date_column,
-    standardize_hevy_sets,
+    normalize_hevy_sets, build_exercise_library,
+    build_exercise_progression, build_progression_recommendations,
 )
+from utils.hevy_schema import ProgressionConfig
 
-
-def get_hevy_sets_from_session() -> pd.DataFrame | None:
-    """
-    Pull sets from session and normalize schema/date columns
-    so downstream analytics never KeyError on 'date'.
-    """
-    df = st.session_state.get("hevy_sets_df")
-    if df is None or getattr(df, "empty", True):
-        return None
-
-    try:
-        df = standardize_hevy_sets(df)
-    except Exception as exc:
-        # last resort: try simpler date ensure to avoid hard failure
-        try:
-            df = ensure_hevy_date_column(df)
-            df["date"] = pd.to_datetime(df["date"], errors="coerce")
-        except Exception:
-            st.error(f"Hevy sets missing required date fields: {exc}")
-            return None
-
-    if df.empty or "date" not in df.columns:
-        return None
-
-    return df
-
-def render_weightlifting_tab():
+def render(hevy_client):
     st.header("Weightlifting")
 
-    with st.expander("Controls", expanded=True):
-        lookback_days = st.number_input(
-            "Lookback days (library)", min_value=7, max_value=365, value=90, step=7
-        )
-        include_warmups = st.checkbox("Include warmups", value=False)
-
-    # --- NEW: allow syncing here ---
-    c1, c2 = st.columns([1, 2])
-    with c1:
-        if st.button("Sync Hevy now", use_container_width=True):
-            try:
-                client = HevyClient()
-                workouts_df, sets_df = client.sync_workouts()
-                sets_df = standardize_hevy_sets(sets_df)
-
-                # Persist for other tabs
-                st.session_state["hevy_workouts_df"] = workouts_df
-                st.session_state["hevy_sets_df"] = sets_df
-
-                st.success(f"Hevy synced: {len(workouts_df)} workouts, {len(sets_df)} sets")
-            except Exception as e:
-                st.error(f"Hevy sync failed: {e}")
-
-    with c2:
-        sets_df = get_hevy_sets_from_session()
-        if sets_df is None:
-            st.info("Sync Hevy workouts first.")
-            with st.expander("Debug: session keys", expanded=False):
-                st.write(sorted(list(st.session_state.keys())))
-            return
-        st.caption(f"Loaded Hevy sets from session: {len(sets_df)} rows")
-
-    # --- Existing analytics ---
-    lib_df = build_exercise_library(
-        sets_df, lookback_days=lookback_days, include_warmups=include_warmups
+    cfg = ProgressionConfig(
+        lookback_days=st.number_input("Lookback days (library)", 7, 365, 90, 1),
+        include_warmups=st.checkbox("Include warmups", value=False),
     )
+
+    # sync
+    if st.button("Sync Hevy now"):
+        workouts_df, sets_df = hevy_client.sync_workouts()
+        st.session_state["hevy_workouts_df"] = workouts_df
+        st.session_state["hevy_sets_df"] = sets_df
+        st.success(f"Hevy synced: {len(workouts_df)} workouts, {len(sets_df)} sets")
+
+    sets_df = st.session_state.get("hevy_sets_df", pd.DataFrame())
+
+    with st.expander("Debug: Hevy raw sets"):
+        st.write(f"Rows: {len(sets_df)}")
+        st.write(list(sets_df.columns)[:50])
+        st.dataframe(sets_df.head(10))
+
+    sets_norm = normalize_hevy_sets(sets_df)
+
+    with st.expander("Debug: Hevy normalized sets"):
+        st.write(f"Rows: {len(sets_norm)}")
+        st.write(list(sets_norm.columns))
+        if not sets_norm.empty:
+            st.write({
+                "min_date": str(sets_norm["date"].min()),
+                "max_date": str(sets_norm["date"].max()),
+                "exercise_count": int(sets_norm["exercise_name"].nunique()),
+            })
+        st.dataframe(sets_norm.head(10))
+
+    if sets_norm.empty:
+        st.info("No usable Hevy sets after normalization. Check column mapping in normalize_hevy_sets().")
+        return
+
     st.subheader("Exercise library")
-    st.dataframe(lib_df, use_container_width=True)
+    lib = build_exercise_library(sets_norm, cfg)
+    st.dataframe(lib, use_container_width=True)
 
-    prog_df = build_exercise_progression(
-        sets_df, lookback_days=lookback_days, include_warmups=include_warmups
-    )
     st.subheader("Progression signals")
-    st.dataframe(prog_df, use_container_width=True)
+    prog = build_exercise_progression(sets_norm, cfg)
+    st.dataframe(prog, use_container_width=True)
 
-    recs_df = build_progression_recommendations(prog_df)
     st.subheader("Recommendations")
-    st.dataframe(recs_df, use_container_width=True)
+    recs = build_progression_recommendations(prog, cfg)
+    st.dataframe(recs, use_container_width=True)
