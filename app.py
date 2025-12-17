@@ -1333,8 +1333,8 @@ def main():
 
     with weight_tab:
         try:
-            from tabs.weightlifting_tab import render_weightlifting_tab
-            render_weightlifting_tab()
+            from tabs.weightlifting_tab import render
+            render(hevy_client)
         except Exception as exc:
             st.error(f"Weightlifting tab error: {exc}")
 
